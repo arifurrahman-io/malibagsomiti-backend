@@ -11,93 +11,122 @@ const path = require("path");
 
 // @desc    Process a monthly deposit (Bulk or Single) with Month/Year tracking
 // @route   POST /api/finance/deposit
+/**
+ * @section 1. Deposits & Collections
+ */
+
+// @desc    Process a monthly deposit (Bulk or Single) with Month/Year tracking
+// @route   POST /api/finance/deposit
 exports.processDeposit = async (req, res) => {
   try {
-    const { userIds, remarks, month, year } = req.body;
+    const { userIds, remarks, month, year } = req.body; // month: "February"
 
     if (!userIds || !Array.isArray(userIds)) {
       return res
         .status(400)
-        .json({ success: false, message: "Provide user IDs array" });
+        .json({ success: false, message: "Invalid user list" });
     }
 
-    const targetMonth = month !== undefined ? month : new Date().getMonth();
+    const targetMonth =
+      month || new Date().toLocaleString("default", { month: "long" });
     const targetYear = year || new Date().getFullYear();
-    const monthName = new Date(0, targetMonth).toLocaleString("default", {
-      month: "long",
-    });
 
     const depositResults = await Promise.all(
       userIds.map(async (id) => {
         const user = await User.findById(id);
         if (!user) return null;
 
-        // Dynamic amount based on shares
         const amount = (user.shares || 1) * 1000;
 
+        // 1. Create Ledger Entry
         const newDeposit = await Transaction.create({
           user: id,
           type: "deposit",
-          category: "monthly_savings",
+          category: "monthly_deposit",
           amount,
           month: targetMonth,
           year: targetYear,
           recordedBy: req.user.id,
-          remarks: remarks || `Monthly deposit for ${monthName} ${targetYear}`,
+          remarks:
+            remarks || `Monthly deposit for ${targetMonth} ${targetYear}`,
         });
 
-        // Calculate total savings for notification
+        // 2. Calculate Total Savings for the Email Receipt
         const totalHistory = await Transaction.aggregate([
-          { $match: { user: user._id, type: "deposit" } },
+          {
+            $match: {
+              user: user._id,
+              type: "deposit",
+              category: "monthly_deposit",
+            },
+          },
           { $group: { _id: null, total: { $sum: "$amount" } } },
         ]);
 
+        // 3. Trigger Professional Email Receipt (Non-blocking)
+        // This ensures the admin doesn't wait for emails to send
         sendDepositEmail(user.email, {
           name: user.name,
           amount,
           totalBalance: totalHistory[0]?.total || amount,
-          date: new Date().toLocaleDateString(),
-          period: `${monthName} ${targetYear}`,
-        });
+          date: new Date().toLocaleDateString("en-GB"), // e.g., 07/01/2026
+          period: `${targetMonth} ${targetYear}`,
+        }).catch((err) =>
+          console.error(`Email failed for ${user.name}:`, err.message)
+        );
 
         return newDeposit;
       })
     );
 
-    res
-      .status(201)
-      .json({ success: true, count: depositResults.filter((r) => r).length });
-  } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Transaction failed",
-      error: error.message,
+    res.status(201).json({
+      success: true,
+      count: depositResults.filter((r) => r).length,
+      message: "Ledger updated and email receipts dispatched.",
     });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 };
 
-// @desc    Check which members have already deposited for a specific month/year
+// Also update checkPayments to match this 1-indexed logic
+// @desc    Check which members have already deposited for a specific month name/year
 // @route   GET /api/finance/check-payments
 exports.checkPayments = async (req, res) => {
   try {
     const { month, year, branch } = req.query;
 
+    /**
+     * 🚀 STRING-BASED LOGIC FIX:
+     * We no longer subtract 1 or parse integers for the month.
+     * We compare the string directly (e.g., "February" === "February").
+     */
     const existingTransactions = await Transaction.find({
       type: "deposit",
-      category: "monthly_savings",
-      month: parseInt(month),
+      category: "monthly_deposit",
+      month: month, // Direct string match (e.g., "January", "February")
       year: parseInt(year),
     }).populate("user", "branch");
 
+    /**
+     * Logic Safeguard:
+     * Use optional chaining (?.) to prevent crashes if a user was
+     * deleted but their transaction remains in the ledger.
+     */
     const paidMemberIds = existingTransactions
-      .filter((t) => t.user && t.user.branch === branch)
+      .filter((t) => t.user?.branch === branch)
       .map((t) => t.user._id);
 
-    res.status(200).json({ success: true, data: paidMemberIds });
+    res.status(200).json({
+      success: true,
+      data: paidMemberIds,
+    });
   } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Check failed", error: error.message });
+    res.status(500).json({
+      success: false,
+      message: "Payment check failed",
+      error: error.message,
+    });
   }
 };
 
@@ -505,5 +534,59 @@ exports.deleteTransaction = async (req, res) => {
     res.json({ success: true, message: "Transaction removed" });
   } catch (error) {
     res.status(500).json({ message: error.message });
+  }
+};
+
+exports.getCollectionTrend = async (req, res) => {
+  try {
+    const currentYear = new Date().getFullYear();
+
+    // 1. Aggregate deposits by month and year
+    const trendData = await Transaction.aggregate([
+      {
+        $match: {
+          type: "deposit",
+          category: "monthly_deposit",
+          year: currentYear,
+        },
+      },
+      {
+        $group: {
+          _id: "$month", // This is now "January", "February", etc.
+          total: { $sum: "$amount" },
+        },
+      },
+    ]);
+
+    // 2. Define chronological order for string months
+    const monthOrder = [
+      "January",
+      "February",
+      "March",
+      "April",
+      "May",
+      "June",
+      "July",
+      "August",
+      "September",
+      "October",
+      "November",
+      "December",
+    ];
+
+    // 3. Map and Sort data for the frontend chart
+    const dynamicTrend = monthOrder
+      .map((m) => {
+        const found = trendData.find((d) => d._id === m);
+        return {
+          name: m.substring(0, 3), // "January" -> "Jan"
+          total: found ? found.total : 0,
+        };
+      })
+      .filter((m) => m.total > 0); // Optional: Only show months with data
+
+    res.status(200).json({ success: true, trend: dynamicTrend });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 };

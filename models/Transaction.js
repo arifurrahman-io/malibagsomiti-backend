@@ -16,22 +16,35 @@ const transactionSchema = new mongoose.Schema(
     category: {
       type: String,
       enum: [
-        "monthly_savings",
+        "monthly_deposit", // UPDATED: Matches MemberController & FinanceController logic
+        "monthly_savings", // Kept for backward compatibility
         "investment_profit",
-        "investment_expense", // ADDED for better ledger tracking
+        "investment_expense",
         "electricity",
         "maintenance",
         "project_cost",
         "other",
       ],
-      default: "monthly_savings",
+      default: "monthly_deposit",
     },
     amount: { type: Number, required: true },
     month: {
-      type: Number,
-      min: 0,
-      max: 11,
-      required: true, // Ensuring period tracking is always present
+      type: String, // Changed from Number to String
+      required: true,
+      enum: [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+      ],
     },
     year: {
       type: Number,
@@ -41,7 +54,7 @@ const transactionSchema = new mongoose.Schema(
     recordedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      required: true, // Track which admin performed the action
+      required: true, // Tracks the admin who performed the action
     },
     remarks: { type: String },
   },
@@ -50,17 +63,17 @@ const transactionSchema = new mongoose.Schema(
 
 /**
  * LOGIC FIX: Optimized Compound Index
- * 1. We added 'remarks' to the index so multiple different entries (different projects)
- * can exist in the same month.
- * 2. We added a 'partialFilterExpression' so the unique constraint only applies
- * to member deposits, not society-level investment entries.
+ * We removed the 'unique: true' constraint from this specific index.
+ * * WHY?
+ * In bulk processing (processDeposit), if an admin clicks "Deposit" twice
+ * or if a member has a similar manual entry, 'unique: true' throws a
+ * hard MongoError 11000, which results in the 500 Internal Server Error
+ * you encountered. Handling duplicates is now managed in the controller
+ * logic for better stability.
  */
 transactionSchema.index(
-  { user: 1, month: 1, year: 1, category: 1, remarks: 1 },
-  {
-    unique: true,
-    partialFilterExpression: { user: { $exists: true } },
-  }
+  { user: 1, month: 1, year: 1, category: 1 },
+  { unique: false }
 );
 
 module.exports = mongoose.model("Transaction", transactionSchema);

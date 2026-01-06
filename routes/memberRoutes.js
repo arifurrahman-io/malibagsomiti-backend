@@ -1,30 +1,38 @@
 const express = require("express");
 const router = express.Router();
 const {
-  getAllMembers, // Ensure this matches the controller export name
-  createMember, // Ensure this matches the controller export name
-  getMemberProfile, // This is likely the cause of the error
+  getAllMembers,
+  createMember,
+  getMemberProfile,
   updateMember,
   toggleStatus,
+  deleteMember, // Newly added from controller
 } = require("../controllers/memberController");
 const { protect, authorize } = require("../middleware/authMiddleware");
 
 // All member routes require login
 router.use(protect);
 
-// GET personal profile
-// Check if getMemberProfile is correctly imported above
+/**
+ * @desc    Get detailed member profile + Financial Summary
+ * @route   GET /api/members/profile/:id
+ * @access  Protected (All logged-in users)
+ */
 router.get("/profile/:id", getMemberProfile);
 
-// Admin & Super Admin Only Routes
+/**
+ * @desc    Admin & Super Admin Section
+ * @access  Restricted
+ */
 router
   .route("/")
-  .get(authorize("admin", "super-admin"), getAllMembers)
-  .post(authorize("admin", "super-admin"), createMember);
+  .get(authorize("admin", "super-admin"), getAllMembers) // Fetch member list
+  .post(authorize("admin", "super-admin"), createMember); // Register new member
 
 router
   .route("/:id")
-  .put(authorize("admin", "super-admin"), updateMember)
-  .patch(authorize("super-admin"), toggleStatus);
+  .put(authorize("admin", "super-admin"), updateMember) // Update member details
+  .patch(authorize("super-admin"), toggleStatus) // Toggle active/inactive status
+  .delete(authorize("super-admin"), deleteMember); // Permanently remove member
 
 module.exports = router;

@@ -18,6 +18,7 @@ exports.createMember = async (req, res) => {
     } = req.body;
 
     // 1. Check if member already exists
+    // Uses $or to check both unique fields (Email and NID)
     const memberExists = await User.findOne({ $or: [{ email }, { nid }] });
     if (memberExists) {
       return res.status(400).json({
@@ -26,26 +27,41 @@ exports.createMember = async (req, res) => {
       });
     }
 
-    // 2. Create member with expanded fields
+    // 2. Data Sanitization & Financial Calculation
+    const shareCount = parseInt(shares) || 1; // Default to 1 if empty
+
+    // Auto-calculate monthly subscription: 1000 BDT per share
+    const monthlySubscription = shareCount * 1000;
+
+    // 3. Database Entry
+    // The pre-save hook in the User model will handle password hashing
     const member = await User.create({
       name,
       email,
       password,
       phone,
       nid,
-      bankAccount,
+      bankAccount, // Fixed: Matches database field name to prevent "N/A"
       branch,
-      shares,
+      shares: shareCount,
       joiningDate: joiningDate || Date.now(),
-      monthlySubscription: (shares || 1) * 1000, // Auto-calculate subscription
+      monthlySubscription,
+      role: "member", // Explicitly set role for security
     });
 
+    // 4. Success Response
     res.status(201).json({
       success: true,
       message: "Member registered successfully",
-      data: { id: member._id, name: member.name, email: member.email },
+      data: {
+        id: member._id,
+        name: member.name,
+        email: member.email,
+        bankAccount: member.bankAccount, // Ensure UI receives bank info immediately
+      },
     });
   } catch (error) {
+    // Catch-all for schema validation errors (e.g., duplicate NID or Email)
     res.status(500).json({
       success: false,
       message: "Registration failed",
@@ -59,15 +75,44 @@ exports.createMember = async (req, res) => {
 exports.getAllMembers = async (req, res) => {
   try {
     const { branch, status } = req.query;
-    let query = { role: "member" };
 
-    if (branch) query.branch = branch;
-    if (status) query.status = status;
+    // Build the initial match filter
+    let matchFilter = { role: "member" };
+    if (branch) matchFilter.branch = branch;
+    if (status) matchFilter.status = status;
 
-    const members = await User.find(query)
-      .select("-password")
-      .sort({ name: 1 }) // Sorted alphabetically for better UX
-      .lean();
+    const members = await User.aggregate([
+      { $match: matchFilter },
+      {
+        $lookup: {
+          from: "transactions", // Must match your MongoDB collection name
+          localField: "_id",
+          foreignField: "user",
+          as: "transactions",
+        },
+      },
+      {
+        $addFields: {
+          totalDeposited: {
+            $sum: {
+              $map: {
+                input: {
+                  $filter: {
+                    input: "$transactions",
+                    as: "t",
+                    cond: { $eq: ["$$t.category", "monthly_deposit"] },
+                  },
+                },
+                as: "deposit",
+                in: "$$deposit.amount",
+              },
+            },
+          },
+        },
+      },
+      { $project: { transactions: 0, password: 0 } }, // Remove sensitive/bloated data
+      { $sort: { name: 1 } },
+    ]);
 
     res.status(200).json({
       success: true,
@@ -76,7 +121,7 @@ exports.getAllMembers = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to fetch members",
+      message: "Failed to fetch members with financial data",
       error: error.message,
     });
   }

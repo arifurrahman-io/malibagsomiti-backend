@@ -9,36 +9,49 @@ const path = require("path");
  * @section 1. Deposits & Collections
  */
 
-// @desc    Process a monthly deposit (Bulk or Single) with Month/Year tracking
-// @route   POST /api/finance/deposit
 /**
- * @section 1. Deposits & Collections
+ * @desc    Process bulk monthly deposits and snapshot bank details
+ * @route   POST /api/finance/deposit
+ * @access  Admin/Super-Admin
  */
-
-// @desc    Process a monthly deposit (Bulk or Single) with Month/Year tracking
-// @route   POST /api/finance/deposit
 exports.processDeposit = async (req, res) => {
   try {
-    const { userIds, remarks, month, year } = req.body; // month: "February"
+    const { userIds, remarks, month, year } = req.body;
 
+    // 1. Validate Input
     if (!userIds || !Array.isArray(userIds)) {
-      return res
-        .status(400)
-        .json({ success: false, message: "Invalid user list" });
+      return res.status(400).json({
+        success: false,
+        message: "A valid list of Member IDs is required for batch processing.",
+      });
     }
 
+    // 2. Standardize Date Period (Supports String-based months like "February")
     const targetMonth =
       month || new Date().toLocaleString("default", { month: "long" });
     const targetYear = year || new Date().getFullYear();
 
+    // 3. Process Batch
     const depositResults = await Promise.all(
       userIds.map(async (id) => {
+        // Fetch fresh user data to get current shares and bank account
         const user = await User.findById(id);
         if (!user) return null;
 
         const amount = (user.shares || 1) * 1000;
 
-        // 1. Create Ledger Entry
+        /**
+         * 🚀 SNAPSHOT LOGIC:
+         * We save the bank account directly into the remarks or a dedicated field.
+         * This prevents "No A/C" issues in future audit reports.
+         */
+        const snapshotRemarks = remarks
+          ? `${remarks} (A/C: ${user.bankAccount || "N/A"})`
+          : `Monthly deposit for ${targetMonth} ${targetYear} | A/C: ${
+              user.bankAccount || "N/A"
+            }`;
+
+        // Create Ledger Entry
         const newDeposit = await Transaction.create({
           user: id,
           type: "deposit",
@@ -47,11 +60,11 @@ exports.processDeposit = async (req, res) => {
           month: targetMonth,
           year: targetYear,
           recordedBy: req.user.id,
-          remarks:
-            remarks || `Monthly deposit for ${targetMonth} ${targetYear}`,
+          // ✅ Store the A/C in remarks so it is always visible in the database
+          remarks: `${remarks} | A/C: ${user.bankAccount || "N/A"}`,
         });
 
-        // 2. Calculate Total Savings for the Email Receipt
+        // 4. Aggregate Real-time Balance for the Receipt
         const totalHistory = await Transaction.aggregate([
           {
             $match: {
@@ -63,29 +76,36 @@ exports.processDeposit = async (req, res) => {
           { $group: { _id: null, total: { $sum: "$amount" } } },
         ]);
 
-        // 3. Trigger Professional Email Receipt (Non-blocking)
-        // This ensures the admin doesn't wait for emails to send
+        // 5. Professional Email Dispatch (Non-blocking)
         sendDepositEmail(user.email, {
           name: user.name,
           amount,
           totalBalance: totalHistory[0]?.total || amount,
-          date: new Date().toLocaleDateString("en-GB"), // e.g., 07/01/2026
+          date: new Date().toLocaleDateString("en-GB"),
           period: `${targetMonth} ${targetYear}`,
+          bankAccount: user.bankAccount || "Not Linked",
         }).catch((err) =>
-          console.error(`Email failed for ${user.name}:`, err.message)
+          console.error(`Email dispatch failed for ${user.name}:`, err.message)
         );
 
         return newDeposit;
       })
     );
 
+    // 6. Finalize Response
+    const successCount = depositResults.filter((r) => r).length;
+
     res.status(201).json({
       success: true,
-      count: depositResults.filter((r) => r).length,
-      message: "Ledger updated and email receipts dispatched.",
+      count: successCount,
+      message: `Batch complete: ${successCount} ledger entries created and receipts queued.`,
     });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    console.error("Batch Processing Error:", error.message);
+    res.status(500).json({
+      success: false,
+      error: "Internal Server Error during batch processing.",
+    });
   }
 };
 
@@ -517,9 +537,10 @@ exports.downloadInvestmentReport = async (req, res) => {
 exports.getAllTransactions = async (req, res) => {
   try {
     const transactions = await Transaction.find()
-      .populate("user", "name bankAccountNumber") // Fixed: Explicitly fetch bank info
+      .populate("user", "name bankAccount") // ✅ Pulls these fields from the User model
       .populate("recordedBy", "name")
       .sort({ date: -1 });
+
     res.status(200).json({ success: true, data: transactions });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });

@@ -1,8 +1,12 @@
 const User = require("../models/User");
 const Transaction = require("../models/Transaction");
+const mongoose = require("mongoose");
 
-// @desc    Register a new member (Create)
-// @route   POST /api/members
+/**
+ * @desc    Register a new member (Create)
+ * @route   POST /api/members
+ * @access  Admin/Super-Admin
+ */
 exports.createMember = async (req, res) => {
   try {
     const {
@@ -17,8 +21,6 @@ exports.createMember = async (req, res) => {
       joiningDate,
     } = req.body;
 
-    // 1. Check if member already exists
-    // Uses $or to check both unique fields (Email and NID)
     const memberExists = await User.findOne({ $or: [{ email }, { nid }] });
     if (memberExists) {
       return res.status(400).json({
@@ -27,29 +29,24 @@ exports.createMember = async (req, res) => {
       });
     }
 
-    // 2. Data Sanitization & Financial Calculation
-    const shareCount = parseInt(shares) || 1; // Default to 1 if empty
-
-    // Auto-calculate monthly subscription: 1000 BDT per share
+    const shareCount = parseInt(shares) || 1;
+    // Calculation logic matching society rules
     const monthlySubscription = shareCount * 1000;
 
-    // 3. Database Entry
-    // The pre-save hook in the User model will handle password hashing
     const member = await User.create({
       name,
       email,
       password,
       phone,
       nid,
-      bankAccount, // Fixed: Matches database field name to prevent "N/A"
+      bankAccount,
       branch,
       shares: shareCount,
-      joiningDate: joiningDate || Date.now(),
+      joiningDate: joiningDate || Date.now(), // Fixed field name for frontend consistency
       monthlySubscription,
-      role: "member", // Explicitly set role for security
+      role: "member",
     });
 
-    // 4. Success Response
     res.status(201).json({
       success: true,
       message: "Member registered successfully",
@@ -57,11 +54,10 @@ exports.createMember = async (req, res) => {
         id: member._id,
         name: member.name,
         email: member.email,
-        bankAccount: member.bankAccount, // Ensure UI receives bank info immediately
+        joiningDate: member.joiningDate,
       },
     });
   } catch (error) {
-    // Catch-all for schema validation errors (e.g., duplicate NID or Email)
     res.status(500).json({
       success: false,
       message: "Registration failed",
@@ -70,13 +66,14 @@ exports.createMember = async (req, res) => {
   }
 };
 
-// @desc    Get all members with branch/status filtering (Read)
-// @route   GET /api/members
+/**
+ * @desc    Get all members with branch/status filtering (Read)
+ * @route   GET /api/members
+ */
 exports.getAllMembers = async (req, res) => {
   try {
     const { branch, status } = req.query;
 
-    // Build the initial match filter
     let matchFilter = { role: "member" };
     if (branch) matchFilter.branch = branch;
     if (status) matchFilter.status = status;
@@ -85,7 +82,7 @@ exports.getAllMembers = async (req, res) => {
       { $match: matchFilter },
       {
         $lookup: {
-          from: "transactions", // Must match your MongoDB collection name
+          from: "transactions",
           localField: "_id",
           foreignField: "user",
           as: "transactions",
@@ -100,7 +97,7 @@ exports.getAllMembers = async (req, res) => {
                   $filter: {
                     input: "$transactions",
                     as: "t",
-                    cond: { $eq: ["$$t.category", "monthly_deposit"] },
+                    cond: { $eq: ["$$t.type", "deposit"] },
                   },
                 },
                 as: "deposit",
@@ -110,30 +107,36 @@ exports.getAllMembers = async (req, res) => {
           },
         },
       },
-      { $project: { transactions: 0, password: 0 } }, // Remove sensitive/bloated data
+      { $project: { transactions: 0, password: 0 } },
       { $sort: { name: 1 } },
     ]);
 
-    res.status(200).json({
-      success: true,
-      data: members,
-    });
+    res.status(200).json({ success: true, data: members });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to fetch members with financial data",
+      message: "Failed to fetch members",
       error: error.message,
     });
   }
 };
 
-// @desc    Get detailed member profile + Financial Summary (Read)
-// @route   GET /api/members/profile/:id
+/**
+ * @desc    Get detailed member profile + Personal Financial Summary (Read)
+ * @route   GET /api/members/profile/:id
+ * @access  Private (Member/Admin)
+ */
 exports.getMemberProfile = async (req, res) => {
   try {
-    const member = await User.findById(req.params.id)
-      .select("-password")
-      .lean();
+    const targetId = req.params.id || req.user.id;
+
+    if (!mongoose.Types.ObjectId.isValid(targetId)) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Invalid User ID" });
+    }
+
+    const member = await User.findById(targetId).select("-password").lean();
 
     if (!member) {
       return res
@@ -141,52 +144,69 @@ exports.getMemberProfile = async (req, res) => {
         .json({ success: false, message: "Member not found" });
     }
 
-    // Aggregate financial stats for dynamic UI cards
+    // Comprehensive financial aggregation for the profile view
     const stats = await Transaction.aggregate([
-      { $match: { user: member._id } },
-      { $group: { _id: "$category", total: { $sum: "$amount" } } },
+      {
+        $match: {
+          user: new mongoose.Types.ObjectId(targetId),
+          type: "deposit",
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
     ]);
 
     const financialSummary = {
-      totalDeposits: stats.find((s) => s._id === "monthly_deposit")?.total || 0,
-      shareValue: (member.shares || 1) * 1000,
-      recentTransactions: await Transaction.find({ user: member._id })
+      totalDeposits: stats[0]?.total || 0,
+      currentShareCount: member.shares || 0,
+      estimatedShareValue: (member.shares || 1) * 1000,
+      recentTransactions: await Transaction.find({ user: targetId })
         .sort({ date: -1 })
         .limit(5)
         .lean(),
     };
 
-    res.status(200).json({ success: true, ...member, financialSummary });
+    res.status(200).json({
+      success: true,
+      data: {
+        ...member,
+        id: member._id, // Normalize ID for frontend
+        financialSummary,
+      },
+    });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Error loading profile" });
+    res.status(500).json({
+      success: false,
+      message: "Error loading profile data",
+      error: error.message,
+    });
   }
 };
 
-// @desc    Update member details (Admin Only)
-// @route   PUT /api/members/:id
+/**
+ * @desc    Update member details (Admin Only)
+ * @route   PUT /api/members/:id
+ */
 exports.updateMember = async (req, res) => {
   try {
     const updateData = { ...req.body };
 
-    // 1. FIX: Remove password if it is empty or provided as an empty string
-    // This prevents validation errors for a required password field during updates
+    // Prevent password being overwritten by empty strings
     if (!updateData.password || updateData.password.trim() === "") {
       delete updateData.password;
     }
 
-    // 2. Logic: Recalculate subscription if shares are changed
+    // Auto-update subscription if shares change
     if (updateData.shares) {
       updateData.monthlySubscription = updateData.shares * 1000;
     }
 
-    // 3. FIX: Use 'context: query' to let Mongoose know this is a partial update
     const updatedMember = await User.findByIdAndUpdate(
       req.params.id,
       { $set: updateData },
       {
         new: true,
         runValidators: true,
-        context: "query", // Critical for partial updates with required fields
+        context: "query",
       }
     ).select("-password");
 
@@ -198,35 +218,35 @@ exports.updateMember = async (req, res) => {
 
     res.status(200).json({
       success: true,
-      message: "Member updated successfully",
+      message: "Member record synchronized successfully",
       data: updatedMember,
     });
   } catch (error) {
     res.status(400).json({
       success: false,
-      message: "Update failed. Ensure all required fields are valid.",
+      message: "Update synchronization failed",
       error: error.message,
     });
   }
 };
 
-// @desc    Toggle Member Status (Update)
-// @route   PATCH /api/members/:id/status
+/**
+ * @desc    Toggle Member Status (Active/Inactive)
+ */
 exports.toggleStatus = async (req, res) => {
   try {
     const user = await User.findById(req.params.id);
-    if (!user) {
+    if (!user)
       return res
         .status(404)
         .json({ success: false, message: "User not found" });
-    }
 
     user.status = user.status === "active" ? "inactive" : "active";
     await user.save();
 
     res.status(200).json({
       success: true,
-      message: `Member is now ${user.status}`,
+      message: `Member status updated to ${user.status}`,
       status: user.status,
     });
   } catch (error) {
@@ -234,36 +254,33 @@ exports.toggleStatus = async (req, res) => {
   }
 };
 
-// @desc    Permanently delete a member (Delete - Super Admin Only)
-// @route   DELETE /api/members/:id
+/**
+ * @desc    Permanently delete a member (Delete - Super Admin Only)
+ */
 exports.deleteMember = async (req, res) => {
   try {
     const member = await User.findById(req.params.id);
 
-    if (!member) {
+    if (!member)
       return res
         .status(404)
         .json({ success: false, message: "Member not found" });
-    }
 
-    // Security check: Don't allow deleting other admins via this route
     if (member.role !== "member") {
       return res.status(403).json({
         success: false,
-        message: "Only member accounts can be deleted",
+        message: "Governance safety: Only member accounts can be removed",
       });
     }
 
     await User.findByIdAndDelete(req.params.id);
-
-    res.status(200).json({
-      success: true,
-      message: "Member permanently removed from society database",
-    });
+    res
+      .status(200)
+      .json({ success: true, message: "Member removed from registry" });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Deletion failed",
+      message: "Registry deletion failed",
       error: error.message,
     });
   }

@@ -17,6 +17,8 @@ const {
   deleteInvestment,
   downloadInvestmentReport, // NEW: For the printable PDF report
   getAllTransactions,
+  getMemberHistory,
+  getMemberSummary,
 } = require("../controllers/financeController");
 
 const { protect, authorize } = require("../middleware/authMiddleware");
@@ -143,5 +145,8 @@ router.get(
   authorize("admin", "super-admin"),
   getAllTransactions
 );
+
+router.get("/history/:id", protect, getMemberHistory);
+router.get("/member-summary", protect, getMemberSummary);
 
 module.exports = router;

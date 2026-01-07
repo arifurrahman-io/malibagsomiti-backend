@@ -4,6 +4,7 @@ const Investment = require("../models/Investment");
 const { sendDepositEmail } = require("../utils/sendEmail");
 const fs = require("fs");
 const path = require("path");
+const mongoose = require("mongoose");
 
 /**
  * @section 1. Deposits & Collections
@@ -56,12 +57,13 @@ exports.processDeposit = async (req, res) => {
           user: id,
           type: "deposit",
           category: "monthly_deposit",
+          subcategory: "Member Monthly Share", // Integrated subcategory
           amount,
           month: targetMonth,
           year: targetYear,
           recordedBy: req.user.id,
           // ✅ Store the A/C in remarks so it is always visible in the database
-          remarks: `${remarks} | A/C: ${user.bankAccount || "N/A"}`,
+          remarks: `${remarks || "Monthly Deposit"}`,
         });
 
         // 4. Aggregate Real-time Balance for the Receipt
@@ -109,30 +111,25 @@ exports.processDeposit = async (req, res) => {
   }
 };
 
-// Also update checkPayments to match this 1-indexed logic
-// @desc    Check which members have already deposited for a specific month name/year
-// @route   GET /api/finance/check-payments
+/**
+ * @desc    Check which members have already deposited for a specific month name/year
+ * @route   GET /api/finance/check-payments
+ */
 exports.checkPayments = async (req, res) => {
   try {
     const { month, year, branch } = req.query;
 
     /**
      * 🚀 STRING-BASED LOGIC FIX:
-     * We no longer subtract 1 or parse integers for the month.
-     * We compare the string directly (e.g., "February" === "February").
+     * Direct string match for months like "January"
      */
     const existingTransactions = await Transaction.find({
       type: "deposit",
       category: "monthly_deposit",
-      month: month, // Direct string match (e.g., "January", "February")
+      month: month,
       year: parseInt(year),
     }).populate("user", "branch");
 
-    /**
-     * Logic Safeguard:
-     * Use optional chaining (?.) to prevent crashes if a user was
-     * deleted but their transaction remains in the ledger.
-     */
     const paidMemberIds = existingTransactions
       .filter((t) => t.user?.branch === branch)
       .map((t) => t.user._id);
@@ -161,6 +158,13 @@ exports.addExpense = async (req, res) => {
     const expense = await Transaction.create({
       ...req.body,
       type: "expense",
+      // Derive month/year from provided date for consistency
+      month: req.body.date
+        ? new Date(req.body.date).toLocaleString("default", { month: "long" })
+        : new Date().toLocaleString("default", { month: "long" }),
+      year: req.body.date
+        ? new Date(req.body.date).getFullYear()
+        : new Date().getFullYear(),
       recordedBy: req.user.id,
     });
     res.status(201).json({ success: true, data: expense });
@@ -394,13 +398,8 @@ exports.recordInvestmentProfit = async (req, res) => {
         .json({ success: false, message: "Project not found" });
     }
 
-    // Ensure numeric conversion to avoid string concatenation errors
     const numericAmount = parseFloat(amount);
 
-    /** * CALCULATION FIX:
-     * If 'expense', subtract from totalProfit.
-     * If 'deposit' (profit), add to totalProfit.
-     */
     if (type === "expense") {
       investment.totalProfit -= numericAmount;
     } else {
@@ -409,14 +408,15 @@ exports.recordInvestmentProfit = async (req, res) => {
 
     await investment.save();
 
-    // Create corresponding transaction record for the ledger
+    // Create corresponding transaction record with subcategory link
     await Transaction.create({
       user: null,
       type: type === "expense" ? "expense" : "deposit",
       category: type === "expense" ? "investment_expense" : "investment_profit",
+      subcategory: investment.projectName,
       amount: numericAmount,
-      month: month ?? new Date().getMonth(),
-      year: year ?? new Date().getFullYear(),
+      month: month || new Date().toLocaleString("default", { month: "long" }),
+      year: year || new Date().getFullYear(),
       recordedBy: req.user.id,
       remarks: `${type === "expense" ? "Expense" : "Profit"} - ${
         investment.projectName
@@ -438,10 +438,11 @@ exports.getInvestmentHistory = async (req, res) => {
         .status(404)
         .json({ success: false, message: "Project not found" });
 
-    // Find transactions that match the project's name in the remarks
-    // Or, if you add an 'investment' ref field to your Transaction model, use that.
     const history = await Transaction.find({
-      remarks: { $regex: project.projectName, $options: "i" },
+      $or: [
+        { remarks: { $regex: project.projectName, $options: "i" } },
+        { subcategory: project.projectName },
+      ],
     }).sort({ date: -1 });
 
     res.status(200).json({ success: true, data: history });
@@ -450,13 +451,10 @@ exports.getInvestmentHistory = async (req, res) => {
   }
 };
 
-// controllers/financeController.js
-
 // @desc    Get data for printable investment report
 // @route   GET /api/finance/investment/:id/report
 exports.downloadInvestmentReport = async (req, res) => {
   try {
-    // 1. Fetch Investment and populate the admin who recorded it
     const investment = await Investment.findById(req.params.id).populate(
       "recordedBy",
       "name email"
@@ -468,18 +466,13 @@ exports.downloadInvestmentReport = async (req, res) => {
         .json({ success: false, message: "Project not found" });
     }
 
-    /**
-     * 2. Fetch Full Transaction History
-     * Queries all deposits (profits) and expenses linked to this project's name.
-     */
     const history = await Transaction.find({
-      remarks: { $regex: investment.projectName, $options: "i" },
+      $or: [
+        { remarks: { $regex: investment.projectName, $options: "i" } },
+        { subcategory: investment.projectName },
+      ],
     }).sort({ date: 1 });
 
-    /**
-     * 3. LOGICAL FINANCIAL SUMMARY
-     * This calculates the numbers required for the "Summary Cards" in your report.
-     */
     const totalProfits = history
       .filter((t) => t.type === "deposit")
       .reduce((acc, curr) => acc + curr.amount, 0);
@@ -489,9 +482,8 @@ exports.downloadInvestmentReport = async (req, res) => {
       .reduce((acc, curr) => acc + curr.amount, 0);
 
     const initialCapital = investment.amount;
-    const netYield = investment.totalProfit; // Uses the field updated by recordInvestmentProfit
+    const netYield = investment.totalProfit;
 
-    // Calculate performance ROI
     const roi =
       initialCapital > 0
         ? ((netYield / initialCapital) * 100).toFixed(2)
@@ -514,7 +506,7 @@ exports.downloadInvestmentReport = async (req, res) => {
         transactions: history,
         summary: {
           totalInflow: totalProfits,
-          totalOutflow: totalExpenses + initialCapital, // Combined cost of project
+          totalOutflow: totalExpenses + initialCapital,
           transactionCount: history.length,
         },
       },
@@ -530,14 +522,10 @@ exports.downloadInvestmentReport = async (req, res) => {
 };
 
 // @desc    Get all transactions for full audit statement
-// @route   GET /api/finance/all-transactions
-// controllers/financeController.js
-
-// Fetching with Bank Details
 exports.getAllTransactions = async (req, res) => {
   try {
     const transactions = await Transaction.find()
-      .populate("user", "name bankAccount") // ✅ Pulls these fields from the User model
+      .populate("user", "name bankAccount branch")
       .populate("recordedBy", "name")
       .sort({ date: -1 });
 
@@ -547,7 +535,7 @@ exports.getAllTransactions = async (req, res) => {
   }
 };
 
-// Super Admin: Delete any transaction
+// @desc    Super Admin: Delete any transaction
 exports.deleteTransaction = async (req, res) => {
   try {
     const transaction = await Transaction.findByIdAndDelete(req.params.id);
@@ -558,11 +546,11 @@ exports.deleteTransaction = async (req, res) => {
   }
 };
 
+// @desc    Get collection statistics for chart visualization
 exports.getCollectionTrend = async (req, res) => {
   try {
     const currentYear = new Date().getFullYear();
 
-    // 1. Aggregate deposits by month and year
     const trendData = await Transaction.aggregate([
       {
         $match: {
@@ -573,13 +561,12 @@ exports.getCollectionTrend = async (req, res) => {
       },
       {
         $group: {
-          _id: "$month", // This is now "January", "February", etc.
+          _id: "$month",
           total: { $sum: "$amount" },
         },
       },
     ]);
 
-    // 2. Define chronological order for string months
     const monthOrder = [
       "January",
       "February",
@@ -595,19 +582,80 @@ exports.getCollectionTrend = async (req, res) => {
       "December",
     ];
 
-    // 3. Map and Sort data for the frontend chart
     const dynamicTrend = monthOrder
       .map((m) => {
         const found = trendData.find((d) => d._id === m);
         return {
-          name: m.substring(0, 3), // "January" -> "Jan"
+          name: m.substring(0, 3),
           total: found ? found.total : 0,
         };
       })
-      .filter((m) => m.total > 0); // Optional: Only show months with data
+      .filter((m) => m.total > 0);
 
     res.status(200).json({ success: true, trend: dynamicTrend });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * @desc    Get member-specific dashboard stats (Personalized)
+ * @route   GET /api/finance/member-summary
+ * @access  Private (Member/Admin)
+ */
+exports.getMemberSummary = async (req, res) => {
+  try {
+    const userId = req.user.id; // From authMiddleware
+
+    // Calculate ONLY this specific member's total deposits
+    const personalStats = await Transaction.aggregate([
+      {
+        $match: { user: new mongoose.Types.ObjectId(userId), type: "deposit" },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalDeposited: personalStats[0]?.total || 0,
+        bankBalance: personalStats[0]?.total || 0, // Member's personal fund
+        recentTransactions: await Transaction.find({ user: userId })
+          .sort({ date: -1 })
+          .limit(5)
+          .lean(),
+      },
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ success: false, message: "Personal summary failed" });
+  }
+};
+
+/**
+ * @desc    Get personal transaction history for a member
+ * @route   GET /api/finance/history/:id
+ * @access  Private (Member/Admin)
+ */
+exports.getMemberHistory = async (req, res) => {
+  try {
+    // Allows admin to view via params OR member to view via their own ID
+    const userId = req.params.id || req.user.id;
+
+    // Find all transactions for this user regardless of category
+    const history = await Transaction.find({ user: userId })
+      .sort({ date: -1 })
+      .populate("recordedBy", "name")
+      .lean();
+
+    res.status(200).json({
+      success: true,
+      data: history,
+    });
+  } catch (error) {
+    res
+      .status(500)
+      .json({ success: false, message: "History retrieval failed" });
   }
 };

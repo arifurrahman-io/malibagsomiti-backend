@@ -6,33 +6,41 @@ const {
   getMemberProfile,
   updateMember,
   toggleStatus,
-  deleteMember, // Newly added from controller
+  deleteMember,
 } = require("../controllers/memberController");
 const { protect, authorize } = require("../middleware/authMiddleware");
 
-// All member routes require login
+// All member-related operations require a valid JWT session
 router.use(protect);
 
 /**
- * @desc    Get detailed member profile + Financial Summary
- * @route   GET /api/members/profile/:id
- * @access  Protected (All logged-in users)
+ * @desc    Get detailed member profile + Personal Financial Summary
+ * @route   GET /api/members/profile/:id?
+ * @access  Protected (Member/Admin)
+ * 🚀 Note: The ':id?' parameter is now optional.
+ * If omitted, the controller uses the logged-in user's ID.
  */
+// routes/memberRoutes.js
+// Define the specific ID route first, then the base route
 router.get("/profile/:id", getMemberProfile);
+router.get("/profile", getMemberProfile);
 
 /**
- * @desc    Admin & Super Admin Section
- * @access  Restricted
+ * @section Administrative Governance
+ * @access  Restricted to Admin & Super-Admin roles
  */
+
+// Bulk member registry management
 router
   .route("/")
-  .get(authorize("admin", "super-admin"), getAllMembers) // Fetch member list
-  .post(authorize("admin", "super-admin"), createMember); // Register new member
+  .get(authorize("admin", "super-admin"), getAllMembers) // Fetch searchable member directory
+  .post(authorize("admin", "super-admin"), createMember); // Register new society member
 
+// Specific member record modifications
 router
   .route("/:id")
-  .put(authorize("admin", "super-admin"), updateMember) // Update member details
-  .patch(authorize("super-admin"), toggleStatus) // Toggle active/inactive status
-  .delete(authorize("super-admin"), deleteMember); // Permanently remove member
+  .put(authorize("admin", "super-admin"), updateMember) // Update verified credentials or share units
+  .patch(authorize("admin", "super-admin"), toggleStatus) // Deactivate/Reactivate account registry
+  .delete(authorize("super-admin"), deleteMember); // Permanent removal (Super-Admin only)
 
 module.exports = router;

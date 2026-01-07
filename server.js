@@ -58,6 +58,8 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 // 7. API Routes
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/members", require("./routes/memberRoutes"));
+app.use("/api/finance/categories", require("./routes/categoryRoutes"));
+app.use("/api/finance/transaction", require("./routes/transactionRoutes"));
 app.use("/api/finance", require("./routes/financeRoutes"));
 
 // 8. Root Route

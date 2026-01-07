@@ -6,30 +6,35 @@ const transactionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       index: true,
-      required: false, // Explicitly false to allow society-level entries
+      required: false, // Allows society-level entries without a specific member
     },
     type: {
       type: String,
       enum: ["deposit", "expense"],
       required: true,
     },
+    /**
+     * 🔥 FIX 1: Removed strict 'enum' for categories.
+     * This allows the "Direct Entry" page to use any category you create
+     * in the Category Manager dynamically.
+     */
     category: {
       type: String,
-      enum: [
-        "monthly_deposit", // UPDATED: Matches MemberController & FinanceController logic
-        "monthly_savings", // Kept for backward compatibility
-        "investment_profit",
-        "investment_expense",
-        "electricity",
-        "maintenance",
-        "project_cost",
-        "other",
-      ],
+      required: true,
       default: "monthly_deposit",
+    },
+    /**
+     * 🔥 FIX 2: Added 'subcategory' field.
+     * This was missing in your model, causing the 400 error when the
+     * frontend tried to save a sub-classification.
+     */
+    subcategory: {
+      type: String,
+      required: false,
     },
     amount: { type: Number, required: true },
     month: {
-      type: String, // Changed from Number to String
+      type: String,
       required: true,
       enum: [
         "January",
@@ -54,23 +59,14 @@ const transactionSchema = new mongoose.Schema(
     recordedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
-      required: true, // Tracks the admin who performed the action
+      required: true, // Tracks the admin
     },
     remarks: { type: String },
   },
   { timestamps: true }
 );
 
-/**
- * LOGIC FIX: Optimized Compound Index
- * We removed the 'unique: true' constraint from this specific index.
- * * WHY?
- * In bulk processing (processDeposit), if an admin clicks "Deposit" twice
- * or if a member has a similar manual entry, 'unique: true' throws a
- * hard MongoError 11000, which results in the 500 Internal Server Error
- * you encountered. Handling duplicates is now managed in the controller
- * logic for better stability.
- */
+// Optimized Index for reporting performance
 transactionSchema.index(
   { user: 1, month: 1, year: 1, category: 1 },
   { unique: false }

@@ -23,27 +23,17 @@ exports.processDeposit = async (req, res) => {
 
   try {
     const { userIds, remarks, month, year } = req.body;
-
-    if (!userIds || !Array.isArray(userIds)) {
-      throw new Error("A valid list of Member IDs is required.");
-    }
-
-    // 1. Automatically locate the designated Mother Account
     const motherAccount = await BankAccount.findOne({
       isMotherAccount: true,
     }).session(session);
-    if (!motherAccount) {
-      throw new Error(
-        "No Mother Account designated. Set one in Bank Management."
-      );
-    }
+
+    if (!motherAccount) throw new Error("No Mother Account designated.");
 
     const targetMonth =
       month || new Date().toLocaleString("default", { month: "long" });
     const targetYear = year || new Date().getFullYear();
     let totalBatchAmount = 0;
 
-    // 2. Process Batch
     const depositResults = await Promise.all(
       userIds.map(async (id) => {
         const user = await User.findById(id).session(session);
@@ -52,8 +42,7 @@ exports.processDeposit = async (req, res) => {
         const amount = (user.shares || 1) * 1000;
         totalBatchAmount += amount;
 
-        // Create transaction linked to Mother Account
-        const newDeposit = await Transaction.create(
+        return await Transaction.create(
           [
             {
               user: id,
@@ -63,34 +52,38 @@ exports.processDeposit = async (req, res) => {
               amount,
               month: targetMonth,
               year: targetYear,
-              bankAccount: motherAccount._id, // Auto-link
+              date: new Date(), // Set current date for trend grouping
+              bankAccount: motherAccount._id,
               recordedBy: req.user.id,
-              remarks: `${remarks || "Monthly Deposit"}`,
+              remarks: remarks || `Monthly Share: ${targetMonth} ${targetYear}`,
             },
           ],
           { session }
         );
-
-        return newDeposit;
       })
     );
 
-    // 3. Increment Mother Account balance automatically
     motherAccount.currentBalance += totalBatchAmount;
     await motherAccount.save({ session });
 
     await session.commitTransaction();
-    session.endSession();
-
     res.status(201).json({
       success: true,
-      message: `Batch complete. ৳${totalBatchAmount.toLocaleString()} added to ${
-        motherAccount.bankName
-      }.`,
+      message: `Batch of ৳${totalBatchAmount.toLocaleString()} processed.`,
     });
   } catch (error) {
     await session.abortTransaction();
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
     session.endSession();
+  }
+};
+
+exports.getCollectionTrend = async (req, res) => {
+  try {
+    const trend = await this.getInternalTrendData();
+    res.status(200).json({ success: true, trend });
+  } catch (error) {
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -164,44 +157,114 @@ exports.addExpense = async (req, res) => {
 // @desc    Comprehensive Dashboard Summary
 exports.getAdminSummary = async (req, res) => {
   try {
-    const financialStats = await Transaction.aggregate([
-      { $group: { _id: "$type", total: { $sum: "$amount" } } },
-    ]);
+    // 1. Fetch all bank accounts to get actual society liquidity
+    const accounts = await BankAccount.find();
+    const totalLiquidity = accounts.reduce(
+      (sum, acc) => sum + (acc.currentBalance || 0),
+      0
+    );
+
+    // 2. Get Investment Stats
     const investmentStats = await Investment.aggregate([
       { $match: { status: "active" } },
       { $group: { _id: null, total: { $sum: "$amount" } } },
     ]);
 
-    const totalDeposits =
-      financialStats.find((s) => s._id === "deposit")?.total || 0;
-    const totalExpenses =
-      financialStats.find((s) => s._id === "expense")?.total || 0;
-    const totalInvestments = investmentStats[0]?.total || 0;
-    const societyFund = totalDeposits - totalExpenses - totalInvestments;
-
+    // 3. Count Active Members
     const totalMembers = await User.countDocuments({
       role: "member",
       status: "active",
     });
+
+    /**
+     * 🚀 NEW: Aggregate Total Society Shares
+     * Sums the 'shares' field from all active users
+     */
+    const shareStats = await User.aggregate([
+      { $match: { status: "active" } },
+      { $group: { _id: null, totalShares: { $sum: "$shares" } } },
+    ]);
+    const totalSharesCount = shareStats[0]?.totalShares || 0;
+
+    // 4. Get Recent Activity
     const recentTransactions = await Transaction.find()
       .sort({ date: -1 })
-      .limit(6)
+      .limit(8)
       .populate("user", "name")
       .lean();
 
+    // 5. Generate Trend Data
+    const trend = await this.getInternalTrendData();
+
+    // 6. Final Response
     res.status(200).json({
       success: true,
       totalMembers,
-      totalCollection: societyFund,
+      totalSharesCount, // 🔥 Added for Main Dashboard
+      totalCollection: totalLiquidity,
+      totalInvestments: investmentStats[0]?.total || 0,
       recentTransactions,
+      collectionTrend: trend,
     });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Dashboard failed",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
+};
+
+exports.getInternalTrendData = async () => {
+  const currentYear = new Date().getFullYear();
+
+  // Aggregate by the actual 'date' field to support Direct Entries
+  const trendData = await Transaction.aggregate([
+    {
+      $match: {
+        type: "deposit",
+        $or: [
+          { year: currentYear },
+          {
+            date: {
+              $gte: new Date(`${currentYear}-01-01`),
+              $lte: new Date(`${currentYear}-12-31`),
+            },
+          },
+        ],
+      },
+    },
+    {
+      $group: {
+        _id: { $month: "$date" }, // Group by month index (1-12)
+        total: { $sum: "$amount" },
+      },
+    },
+    { $sort: { _id: 1 } },
+  ]);
+
+  const monthNames = [
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ];
+
+  return monthNames
+    .map((name, index) => {
+      const found = trendData.find((d) => d._id === index + 1);
+      return {
+        name: name,
+        total: found ? found.total : 0,
+      };
+    })
+    .filter(
+      (m) => m.total > 0 || new Date().getMonth() >= monthNames.indexOf(m.name)
+    );
 };
 
 // @desc    Get Global Financial Summary (Member View)

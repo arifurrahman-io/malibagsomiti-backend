@@ -21,17 +21,19 @@ exports.createMember = async (req, res) => {
       joiningDate,
     } = req.body;
 
+    // 1. Uniqueness Check
     const memberExists = await User.findOne({ $or: [{ email }, { nid }] });
     if (memberExists) {
       return res.status(400).json({
         success: false,
-        message: "Member with this email or NID already exists",
+        message:
+          "A member with this Email or NID is already registered in the system.",
       });
     }
 
+    // 2. Financial Calibration
     const shareCount = parseInt(shares) || 1;
-    // Calculation logic matching society rules
-    const monthlySubscription = shareCount * 1000;
+    const monthlySubscription = shareCount * 1000; // Standard society rule
 
     const member = await User.create({
       name,
@@ -39,17 +41,17 @@ exports.createMember = async (req, res) => {
       password,
       phone,
       nid,
-      bankAccount,
+      bankAccount, // Member's personal bank for withdrawals
       branch,
       shares: shareCount,
-      joiningDate: joiningDate || Date.now(), // Fixed field name for frontend consistency
+      joiningDate: joiningDate || Date.now(),
       monthlySubscription,
       role: "member",
     });
 
     res.status(201).json({
       success: true,
-      message: "Member registered successfully",
+      message: `${member.name} has been successfully added to the society registry.`,
       data: {
         id: member._id,
         name: member.name,
@@ -60,14 +62,14 @@ exports.createMember = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Registration failed",
+      message: "Registry registration failed.",
       error: error.message,
     });
   }
 };
 
 /**
- * @desc    Get all members with branch/status filtering (Read)
+ * @desc    Get all members with total deposits (Read)
  * @route   GET /api/members
  */
 exports.getAllMembers = async (req, res) => {
@@ -78,6 +80,7 @@ exports.getAllMembers = async (req, res) => {
     if (branch) matchFilter.branch = branch;
     if (status) matchFilter.status = status;
 
+    // Aggregates deposits from the centralized Transaction collection
     const members = await User.aggregate([
       { $match: matchFilter },
       {
@@ -115,7 +118,7 @@ exports.getAllMembers = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Failed to fetch members",
+      message: "Failed to fetch registry data.",
       error: error.message,
     });
   }
@@ -124,7 +127,6 @@ exports.getAllMembers = async (req, res) => {
 /**
  * @desc    Get detailed member profile + Personal Financial Summary (Read)
  * @route   GET /api/members/profile/:id
- * @access  Private (Member/Admin)
  */
 exports.getMemberProfile = async (req, res) => {
   try {
@@ -133,7 +135,7 @@ exports.getMemberProfile = async (req, res) => {
     if (!mongoose.Types.ObjectId.isValid(targetId)) {
       return res
         .status(400)
-        .json({ success: false, message: "Invalid User ID" });
+        .json({ success: false, message: "Invalid User ID format." });
     }
 
     const member = await User.findById(targetId).select("-password").lean();
@@ -141,7 +143,7 @@ exports.getMemberProfile = async (req, res) => {
     if (!member) {
       return res
         .status(404)
-        .json({ success: false, message: "Member not found" });
+        .json({ success: false, message: "Member record not found." });
     }
 
     // Comprehensive financial aggregation for the profile view
@@ -159,9 +161,10 @@ exports.getMemberProfile = async (req, res) => {
       totalDeposits: stats[0]?.total || 0,
       currentShareCount: member.shares || 0,
       estimatedShareValue: (member.shares || 1) * 1000,
+      // Recent transactions pull from both Date-based and Month/Year based entries
       recentTransactions: await Transaction.find({ user: targetId })
         .sort({ date: -1 })
-        .limit(5)
+        .limit(10)
         .lean(),
     };
 
@@ -169,35 +172,35 @@ exports.getMemberProfile = async (req, res) => {
       success: true,
       data: {
         ...member,
-        id: member._id, // Normalize ID for frontend
+        id: member._id,
         financialSummary,
       },
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Error loading profile data",
+      message: "Error loading profile data.",
       error: error.message,
     });
   }
 };
 
 /**
- * @desc    Update member details (Admin Only)
+ * @desc    Update member details & Recalibrate Subscription (Admin Only)
  * @route   PUT /api/members/:id
  */
 exports.updateMember = async (req, res) => {
   try {
     const updateData = { ...req.body };
 
-    // Prevent password being overwritten by empty strings
+    // Prevent security credentials from being overwritten by empty strings
     if (!updateData.password || updateData.password.trim() === "") {
       delete updateData.password;
     }
 
-    // Auto-update subscription if shares change
+    // Auto-update subscription if shares change to maintain treasury integrity
     if (updateData.shares) {
-      updateData.monthlySubscription = updateData.shares * 1000;
+      updateData.monthlySubscription = parseInt(updateData.shares) * 1000;
     }
 
     const updatedMember = await User.findByIdAndUpdate(
@@ -213,18 +216,18 @@ exports.updateMember = async (req, res) => {
     if (!updatedMember) {
       return res
         .status(404)
-        .json({ success: false, message: "Member not found" });
+        .json({ success: false, message: "Member not found." });
     }
 
     res.status(200).json({
       success: true,
-      message: "Member record synchronized successfully",
+      message: "Member record synchronized successfully.",
       data: updatedMember,
     });
   } catch (error) {
     res.status(400).json({
       success: false,
-      message: "Update synchronization failed",
+      message: "Update synchronization failed.",
       error: error.message,
     });
   }
@@ -239,18 +242,18 @@ exports.toggleStatus = async (req, res) => {
     if (!user)
       return res
         .status(404)
-        .json({ success: false, message: "User not found" });
+        .json({ success: false, message: "User not found." });
 
     user.status = user.status === "active" ? "inactive" : "active";
     await user.save();
 
     res.status(200).json({
       success: true,
-      message: `Member status updated to ${user.status}`,
+      message: `Account for ${user.name} is now ${user.status}.`,
       status: user.status,
     });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Status update failed" });
+    res.status(500).json({ success: false, message: "Status update failed." });
   }
 };
 
@@ -264,23 +267,26 @@ exports.deleteMember = async (req, res) => {
     if (!member)
       return res
         .status(404)
-        .json({ success: false, message: "Member not found" });
+        .json({ success: false, message: "Member not found." });
 
+    // Governance safety: Prevents accidental deletion of admin accounts
     if (member.role !== "member") {
       return res.status(403).json({
         success: false,
-        message: "Governance safety: Only member accounts can be removed",
+        message:
+          "Governance Protection: Administrative accounts cannot be removed from this interface.",
       });
     }
 
     await User.findByIdAndDelete(req.params.id);
-    res
-      .status(200)
-      .json({ success: true, message: "Member removed from registry" });
+    res.status(200).json({
+      success: true,
+      message: "Member permanently removed from society registry.",
+    });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "Registry deletion failed",
+      message: "Registry deletion failed.",
       error: error.message,
     });
   }

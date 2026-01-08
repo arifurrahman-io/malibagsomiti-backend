@@ -34,22 +34,32 @@ exports.transferBalance = async (req, res) => {
     const fromAcc = await BankAccount.findById(fromAccountId).session(session);
     const toAcc = await BankAccount.findById(toAccountId).session(session);
 
-    if (fromAcc.currentBalance < Number(amount)) {
-      throw new Error("Insufficient balance in source account.");
+    // 1. Validation Checks
+    if (!fromAcc || !toAcc) {
+      throw new Error("One or both bank accounts could not be located.");
     }
 
-    // 1. Deduct and Add
+    if (fromAcc.currentBalance < Number(amount)) {
+      throw new Error(
+        `Insufficient funds in ${fromAcc.bankName}. Available: ${fromAcc.currentBalance}`
+      );
+    }
+
+    // 2. Execute Balance Movement
     fromAcc.currentBalance -= Number(amount);
     toAcc.currentBalance += Number(amount);
 
     await fromAcc.save({ session });
     await toAcc.save({ session });
 
-    // 2. Record the Transfer in Ledger
+    // 3. Record the Transfer with Correct Classification
     await Transaction.create(
       [
         {
           type: "transfer",
+          // 🔥 FIX: Explicitly set category to avoid defaulting to "monthly_deposit"
+          category: "internal_transfer",
+          subcategory: "Treasury Movement",
           amount: Number(amount),
           month: new Date().toLocaleString("default", { month: "long" }),
           year: new Date().getFullYear(),
@@ -61,16 +71,19 @@ exports.transferBalance = async (req, res) => {
             toAccount: toAccountId,
           },
           recordedBy: req.user.id,
-          bankAccount: toAccountId, // The receiving account
+          bankAccount: toAccountId, // Linked to receiving account for ledger tracking
         },
       ],
       { session }
     );
 
     await session.commitTransaction();
-    res
-      .status(200)
-      .json({ success: true, message: "Balance transfer successful." });
+    res.status(200).json({
+      success: true,
+      message: `Successfully transferred ৳${Number(
+        amount
+      ).toLocaleString()} from ${fromAcc.bankName} to ${toAcc.bankName}.`,
+    });
   } catch (error) {
     await session.abortTransaction();
     res.status(400).json({ success: false, message: error.message });

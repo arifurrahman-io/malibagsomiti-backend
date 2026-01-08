@@ -1,15 +1,16 @@
 const Transaction = require("../models/Transaction");
 const BankAccount = require("../models/BankAccount");
+const Investment = require("../models/Investment"); // 🔥 Added to track project ROI
 const mongoose = require("mongoose");
 
 /**
- * @desc    Create a financial entry synced with Mother Account
- * Supports Month/Year for Share Deposits & Date-selection for General Entries
+ * @desc    Create a financial entry synced with Mother Account & Investment Projects
+ * Supports ROI tracking for Projects and standard Bank Sync for Ledger entries.
  * @route   POST /api/finance/transaction
  * @access  Private (Admin/Super-Admin)
  */
 exports.createTransaction = async (req, res) => {
-  // 1. Start a Session for Atomic Updates
+  // 1. Start a Session for Atomic Updates across three collections
   const session = await mongoose.startSession();
   session.startTransaction();
 
@@ -20,11 +21,11 @@ exports.createTransaction = async (req, res) => {
       subcategory,
       amount,
       remarks,
-      date, // From UI Date Picker
-      month, // From Share Deposit Form (Mandatory for shares)
-      year, // From Share Deposit Form (Mandatory for shares)
-      userId, // Required for member-specific deposits
-      bankAccount, // Linked Mother Account
+      date,
+      month,
+      year,
+      userId,
+      bankAccount,
     } = req.body;
 
     // 2. Strict Validation
@@ -41,11 +42,30 @@ exports.createTransaction = async (req, res) => {
       throw new Error("Target treasury account not found in the registry.");
     }
 
-    // 4. Determine Date and Period
-    // Financial entries use the date picker; Share deposits include month/year
+    const numAmount = Number(amount);
+
+    // 4. 🔥 INVESTMENT ROI TRACKING LOGIC
+    // If the category is 'Investment', we link the subcategory to a project name
+    if (category.toLowerCase().includes("investment") && subcategory) {
+      const project = await Investment.findOne({
+        projectName: subcategory,
+      }).session(session);
+
+      if (project) {
+        // If it's a deposit (Profit), increase project yield; if expense (Loss), decrease it
+        if (type === "deposit") {
+          project.totalProfit += numAmount;
+        } else if (type === "expense") {
+          project.totalProfit -= numAmount;
+        }
+        await project.save({ session });
+      }
+    }
+
+    // 5. Determine Date and Period
     const transactionDate = date ? new Date(date) : new Date();
 
-    // 5. Create Transaction Record
+    // 6. Create Transaction Record
     const transaction = await Transaction.create(
       [
         {
@@ -53,10 +73,8 @@ exports.createTransaction = async (req, res) => {
           type,
           category,
           subcategory,
-          amount: Number(amount),
+          amount: numAmount,
           date: transactionDate,
-          // Month/Year are only saved if explicitly provided (e.g., Member Shares)
-          // This avoids the duplicate key error for standard date-based entries
           month: month || null,
           year: year || null,
           bankAccount,
@@ -69,12 +87,11 @@ exports.createTransaction = async (req, res) => {
       { session }
     );
 
-    // 6. SYNC MOTHER ACCOUNT BALANCE
-    const numAmount = Number(amount);
+    // 7. SYNC MOTHER ACCOUNT BALANCE
     if (type === "deposit") {
       targetBank.currentBalance += numAmount;
     } else if (type === "expense") {
-      // Safety check for expenses
+      // Safety check for treasury liquidity
       if (targetBank.currentBalance < numAmount) {
         throw new Error(
           `Insufficient funds in ${targetBank.bankName}. Current: ${targetBank.currentBalance}`
@@ -86,17 +103,17 @@ exports.createTransaction = async (req, res) => {
     // Save the bank balance update
     await targetBank.save({ session });
 
-    // 7. Commit changes to both collections
+    // 8. Commit changes to Transaction, BankAccount, and Investment collections
     await session.commitTransaction();
     session.endSession();
 
     res.status(201).json({
       success: true,
       data: transaction[0],
-      message: `Ledger entry saved and ${targetBank.bankName} balance updated.`,
+      message: `Ledger synchronized, Bank balance updated, and Project ROI calculated.`,
     });
   } catch (error) {
-    // 8. Rollback: Ensure data consistency
+    // 9. Rollback: Ensure no partial data is saved if any step fails
     await session.abortTransaction();
     session.endSession();
 

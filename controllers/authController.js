@@ -2,12 +2,13 @@ const User = require("../models/User");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
 
+// @desc    Authenticate user & get token
+// @route   POST /api/auth/login
 exports.login = async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    // 1. Find user and explicitly include the password field
-    // Added .select("+password") because the model hides it by default
+    // 1. Find user and explicitly include hidden fields needed for state
     const user = await User.findOne({ email }).select("+password");
 
     if (!user) {
@@ -17,7 +18,7 @@ exports.login = async (req, res) => {
       });
     }
 
-    // 2. Compare the entered password with the hashed password in DB
+    // 2. Compare passwords
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
@@ -27,14 +28,18 @@ exports.login = async (req, res) => {
       });
     }
 
-    // 3. Generate JWT Token
+    // 3. Generate JWT
     const token = jwt.sign(
       { id: user._id, role: user.role },
       process.env.JWT_SECRET,
       { expiresIn: "1d" }
     );
 
-    // 4. Send response aligned with frontend store expectations
+    /**
+     * 4. SYNCED RESPONSE:
+     * Added 'joiningDate' to fix the "N/A" dashboard issue.
+     * Added 'phone' to ensure Member ID shows correctly.
+     */
     res.json({
       success: true,
       token,
@@ -42,13 +47,14 @@ exports.login = async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
+        phone: user.phone, // ✅ Fixed: For Member ID visibility
         role: user.role,
         branch: user.branch,
-        shares: user.shares || 1, // Ensure numeric value for dashboard logic
+        shares: user.shares || 0,
+        joiningDate: user.joiningDate, // ✅ Fixed: Resolves "Membership Active: N/A"
       },
     });
   } catch (error) {
-    // Log the error for backend debugging
     console.error("Login Controller Error:", error);
     res.status(500).json({
       success: false,
@@ -63,27 +69,32 @@ exports.updateProfile = async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
 
-    if (user) {
-      user.name = req.body.name || user.name;
-      user.phone = req.body.phone || user.phone;
-      // Email is usually kept static for account integrity
-
-      const updatedUser = await user.save();
-
-      res.json({
-        success: true,
-        data: {
-          id: updatedUser._id,
-          name: updatedUser.name,
-          email: updatedUser.email,
-          role: updatedUser.role,
-          branch: updatedUser.branch,
-          phone: updatedUser.phone,
-        },
-      });
-    } else {
-      res.status(404).json({ success: false, message: "User not found" });
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
     }
+
+    // Update allowable fields
+    user.name = req.body.name || user.name;
+    user.phone = req.body.phone || user.phone;
+
+    const updatedUser = await user.save();
+
+    // Return the full updated object to refresh the frontend store correctly
+    res.json({
+      success: true,
+      data: {
+        id: updatedUser._id,
+        name: updatedUser.name,
+        email: updatedUser.email,
+        phone: updatedUser.phone,
+        role: updatedUser.role,
+        branch: updatedUser.branch,
+        shares: updatedUser.shares,
+        joiningDate: updatedUser.joiningDate, // ✅ Maintain sync after profile update
+      },
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -101,7 +112,7 @@ exports.updatePassword = async (req, res) => {
         .json({ success: false, message: "User not found" });
     }
 
-    // Check current password
+    // Verify current credentials
     const isMatch = await bcrypt.compare(
       req.body.currentPassword,
       user.password
@@ -112,10 +123,14 @@ exports.updatePassword = async (req, res) => {
         .json({ success: false, message: "Invalid current password" });
     }
 
+    // Hash is handled by the User model's pre-save middleware
     user.password = req.body.newPassword;
     await user.save();
 
-    res.json({ success: true, message: "Password updated successfully" });
+    res.json({
+      success: true,
+      message: "Security credentials updated successfully",
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

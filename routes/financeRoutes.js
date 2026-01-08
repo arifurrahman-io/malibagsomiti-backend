@@ -7,7 +7,6 @@ const {
   addExpense,
   addInvestment,
   recordInvestmentProfit,
-  getSocietySummary,
   getAdminSummary,
   getBranchSummary,
   checkPayments,
@@ -15,17 +14,16 @@ const {
   getInvestmentHistory,
   updateInvestment,
   deleteInvestment,
-  downloadInvestmentReport, // NEW: For the printable PDF report
+  downloadInvestmentReport,
   getAllTransactions,
   getMemberHistory,
-  getMemberSummary,
+  getMemberSummary, // Personalized registry list for members
 } = require("../controllers/financeController");
 
 const { protect, authorize } = require("../middleware/authMiddleware");
 
 /**
  * 1. Multer Storage Configuration
- * Ensures files have correct extensions to prevent 404 errors on download
  */
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
@@ -50,44 +48,43 @@ const upload = multer({
   },
 });
 
-// All finance routes require authentication
+// All finance routes require base authentication
 router.use(protect);
 
 /**
  * @section Administrative Transactions
- * Restricted to Admin and Super-Admin roles.
+ * Strictly restricted to Admin/Super-Admin roles.
  */
 
-// Deposits: Process monthly collections with period tracking
+// Monthly Share Collections
 router.post("/deposit", authorize("admin", "super-admin"), processDeposit);
 
-// Expenses: Record society spending
+// Society Expenditures
 router.post("/expense", authorize("admin", "super-admin"), addExpense);
 
-// Investments: Record new project investments with legal document upload
+// New Project Registry
 router.post(
   "/investment",
   authorize("admin", "super-admin"),
-  upload.single("legalDocs"), // MUST match frontend key
+  upload.single("legalDocs"),
   addInvestment
 );
 
-// History: View ledger for a specific project
+// Project Ledger Access
 router.get(
   "/investment/:id/history",
   authorize("admin", "super-admin"),
   getInvestmentHistory
 );
 
-// Monthly Profit/Expense: Logic for adding returns or costs to a project
+// Project Yield/ROI Entry
 router.post(
   "/investment/:id/profit",
   authorize("admin", "super-admin"),
   recordInvestmentProfit
 );
 
-// NEW: Report: Download printable investment financial summary
-
+// Printable Audit Reports for Projects
 router.get(
   "/investment/:id/report",
   authorize("admin", "super-admin"),
@@ -96,40 +93,33 @@ router.get(
 
 /**
  * @section Dashboard & Analytics
+ * Shared routes that allow all users to view global metrics.
  */
 
-// Global Admin Summary (Powers the "Active Capital" and "Society Fund" cards)
-router.get("/summary", authorize("admin", "super-admin"), getAdminSummary);
+// 🔥 GLOBAL SUMMARY: Accessible to all roles so Society Net Liquidity shows correctly [cite: 2025-10-11]
+router.get("/summary", getAdminSummary);
 
-// Member Personal Summary for teacher-specific views
-router.get(
-  "/member-summary",
-  authorize("member", "admin", "super-admin"),
-  getSocietySummary
-);
+// PERSONAL REGISTRY: Fetches user-specific history for the dashboard sidebar
+router.get("/member-summary", getMemberSummary);
 
-// Payment check to prevent double entries in the collection list
+// Registry Integrity Check
 router.get("/check-payments", authorize("admin", "super-admin"), checkPayments);
 
-// Branch-specific financial analytics
+// Portfolio Overview (Visible to everyone for transparency)
+router.get("/investments", getAllInvestments);
+
+// Regional Analytics
 router.get(
   "/summary/:branch",
   authorize("admin", "super-admin"),
   getBranchSummary
 );
 
-// List of all projects for the Portfolio grid
-router.get(
-  "/investments",
-  authorize("admin", "super-admin"),
-  getAllInvestments
-);
-
 /**
- * @section Super-Admin Management
+ * @section Super-Admin Management & Full Audit
  */
 
-// Update Project: Modify capital or upload new legal docs
+// Project Updates & Legal Doc Modifications
 router.put(
   "/investment/:id",
   authorize("super-admin"),
@@ -137,16 +127,17 @@ router.put(
   updateInvestment
 );
 
-// Delete Project: Remove project and associated local documents
+// Permanent Project Deletion
 router.delete("/investment/:id", authorize("super-admin"), deleteInvestment);
 
+// Full Historical Registry (Admin Audit View)
 router.get(
   "/all-transactions",
   authorize("admin", "super-admin"),
   getAllTransactions
 );
 
-router.get("/history/:id", protect, getMemberHistory);
-router.get("/member-summary", protect, getMemberSummary);
+// Member-Specific History Lookup
+router.get("/history/:id", getMemberHistory);
 
 module.exports = router;

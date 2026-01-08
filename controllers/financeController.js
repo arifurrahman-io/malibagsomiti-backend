@@ -356,23 +356,51 @@ exports.getAllInvestments = async (req, res) => {
 
 // @desc    Add a new society investment project
 exports.addInvestment = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
   try {
-    const legalDocs = req.file ? req.file.path.replace(/\\/g, "/") : null;
-    const investment = await Investment.create({
-      projectName: req.body.projectName,
-      amount: Number(req.body.amount),
-      date: req.body.date || Date.now(),
-      remarks: req.body.remarks,
-      legalDocs,
-      recordedBy: req.user.id,
-    });
-    res.status(201).json({ success: true, data: investment });
+    const { projectName, amount, bankAccount } = req.body;
+    const fundingBank = await BankAccount.findById(bankAccount).session(
+      session
+    );
+
+    if (!fundingBank || fundingBank.currentBalance < amount) {
+      throw new Error("Insufficient funds in selected bank account.");
+    }
+
+    // 1. Create Project
+    const investment = await Investment.create(
+      [{ ...req.body, recordedBy: req.user.id }],
+      { session }
+    );
+
+    // 2. Deduct Capital from Bank
+    fundingBank.currentBalance -= Number(amount);
+    await fundingBank.save({ session });
+
+    // 3. Log Deduction in Ledger
+    await Transaction.create(
+      [
+        {
+          type: "expense",
+          category: "investment_capital",
+          subcategory: projectName,
+          amount: Number(amount),
+          bankAccount: fundingBank._id,
+          recordedBy: req.user.id,
+          remarks: `Capital outflow for ${projectName}`,
+        },
+      ],
+      { session }
+    );
+
+    await session.commitTransaction();
+    res.status(201).json({ success: true, data: investment[0] });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Investment failed",
-      error: error.message,
-    });
+    await session.abortTransaction();
+    res.status(400).json({ success: false, message: error.message });
+  } finally {
+    session.endSession();
   }
 };
 

@@ -138,7 +138,10 @@ exports.getMemberProfile = async (req, res) => {
         .json({ success: false, message: "Invalid User ID format." });
     }
 
-    const member = await User.findById(targetId).select("-password").lean();
+    // Convert to ObjectId once to reuse safely in aggregation and find
+    const userObjectId = new mongoose.Types.ObjectId(targetId);
+
+    const member = await User.findById(userObjectId).select("-password").lean();
 
     if (!member) {
       return res
@@ -146,11 +149,11 @@ exports.getMemberProfile = async (req, res) => {
         .json({ success: false, message: "Member record not found." });
     }
 
-    // Comprehensive financial aggregation for the profile view
+    // Comprehensive financial aggregation
     const stats = await Transaction.aggregate([
       {
         $match: {
-          user: new mongoose.Types.ObjectId(targetId),
+          user: userObjectId,
           type: "deposit",
         },
       },
@@ -160,11 +163,12 @@ exports.getMemberProfile = async (req, res) => {
     const financialSummary = {
       totalDeposits: stats[0]?.total || 0,
       currentShareCount: member.shares || 0,
-      estimatedShareValue: (member.shares || 1) * 1000,
-      // Recent transactions pull from both Date-based and Month/Year based entries
-      recentTransactions: await Transaction.find({ user: targetId })
+      estimatedShareValue: (member.shares || 0) * 1000,
+      // Added population for better UI transparency
+      recentTransactions: await Transaction.find({ user: userObjectId })
         .sort({ date: -1 })
         .limit(10)
+        .populate("recordedBy", "name")
         .lean(),
     };
 
@@ -172,11 +176,12 @@ exports.getMemberProfile = async (req, res) => {
       success: true,
       data: {
         ...member,
-        id: member._id,
+        id: member._id.toString(), // Ensure id is a string for frontend consistency
         financialSummary,
       },
     });
   } catch (error) {
+    console.error("Profile Fetch Error:", error);
     res.status(500).json({
       success: false,
       message: "Error loading profile data.",

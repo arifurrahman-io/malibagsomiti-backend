@@ -6,11 +6,12 @@ const transactionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       index: true,
-      required: false, // Allows society-level entries without a specific member
+      required: false, // Allows society-level entries or transfers without a specific member
     },
     type: {
       type: String,
-      enum: ["deposit", "expense"],
+      // 🔥 UPDATE: Added 'transfer' and 'investment' to support new features
+      enum: ["deposit", "expense", "transfer", "investment"],
       required: true,
     },
     /**
@@ -33,6 +34,20 @@ const transactionSchema = new mongoose.Schema(
       required: false,
     },
     amount: { type: Number, required: true },
+
+    // 🔥 NEW: Link transaction to a specific Bank Account (e.g., Mother Account)
+    bankAccount: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "BankAccount",
+      required: false,
+    },
+
+    // 🔥 NEW: Specific details for balance transfers between accounts
+    transferDetails: {
+      fromAccount: { type: mongoose.Schema.Types.ObjectId, ref: "BankAccount" },
+      toAccount: { type: mongoose.Schema.Types.ObjectId, ref: "BankAccount" },
+    },
+
     month: {
       type: String,
       required: true,
@@ -67,8 +82,9 @@ const transactionSchema = new mongoose.Schema(
 );
 
 // Optimized Index for reporting performance
+// 🔥 UPDATE: Added bankAccount and type to index for faster ledger queries
 transactionSchema.index(
-  { user: 1, month: 1, year: 1, category: 1 },
+  { user: 1, month: 1, year: 1, category: 1, bankAccount: 1, type: 1 },
   { unique: false }
 );
 

@@ -14,12 +14,11 @@ require("./utils/cronJobs");
 dotenv.config();
 
 // 2. Connect to Database
-// Note: Ensure your config/db.js uses serverSelectionTimeoutMS to prevent crash loops
 connectDB();
 
 const app = express();
 
-// 3. Ensure Upload Directories Exist for Legal Documents
+// 3. Ensure Upload Directories Exist
 const uploadDir = path.join(__dirname, "uploads/documents");
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
@@ -34,7 +33,6 @@ app.use(
   })
 );
 
-// Dynamic CORS configuration
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -51,13 +49,19 @@ if (process.env.NODE_ENV === "development") {
   app.use(morgan("dev"));
 }
 
-// 6. Static File Serving (Root level access)
-// Enables access via http://localhost:5000/uploads/documents/filename.pdf
+// 6. Static File Serving
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
 // 7. API Routes
 app.use("/api/auth", require("./routes/authRoutes"));
 app.use("/api/members", require("./routes/memberRoutes"));
+
+/**
+ * 🚀 NEW: Society Bank Account Registry
+ * Handles bank names, account numbers, types, and holders.
+ */
+app.use("/api/bank-accounts", require("./routes/bankRoutes")); // <--- ADDED THIS LINE
+
 app.use("/api/finance/categories", require("./routes/categoryRoutes"));
 app.use("/api/finance/transaction", require("./routes/transactionRoutes"));
 app.use("/api/finance", require("./routes/financeRoutes"));
@@ -67,10 +71,10 @@ app.get("/", (req, res) => {
   res.send("Malibag Teachers Society API is running...");
 });
 
-// 9. Centralized Error Handler (Must be last)
+// 9. Centralized Error Handler
 app.use(errorHandler);
 
-// 10. Start Server with enhanced logging
+// 10. Start Server
 const PORT = process.env.PORT || 5000;
 const server = app.listen(PORT, () => {
   console.log(`
@@ -78,14 +82,11 @@ const server = app.listen(PORT, () => {
     📧 Email Service Ready
     ⏰ Cron Jobs Scheduled
     📂 Static Uploads: ${uploadDir}
+    🏦 Bank Registry: /api/bank-accounts
   `);
 });
 
-/**
- * Handle Unhandled Rejections (like MongoDB ETIMEOUT)
- * This prevents nodemon from crashing completely during network flickers.
- */
+// Handle Unhandled Rejections
 process.on("unhandledRejection", (err) => {
   console.error(`Error: ${err.message}`);
-  // Keep the server running but log the error
 });

@@ -5,6 +5,7 @@ const { sendDepositEmail } = require("../utils/sendEmail");
 const fs = require("fs");
 const path = require("path");
 const mongoose = require("mongoose");
+const BankAccount = require("../models/BankAccount");
 
 /**
  * @section 1. Deposits & Collections
@@ -15,99 +16,82 @@ const mongoose = require("mongoose");
  * @route   POST /api/finance/deposit
  * @access  Admin/Super-Admin
  */
+
 exports.processDeposit = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
     const { userIds, remarks, month, year } = req.body;
 
-    // 1. Validate Input
     if (!userIds || !Array.isArray(userIds)) {
-      return res.status(400).json({
-        success: false,
-        message: "A valid list of Member IDs is required for batch processing.",
-      });
+      throw new Error("A valid list of Member IDs is required.");
     }
 
-    // 2. Standardize Date Period (Supports String-based months like "February")
+    // 1. Automatically locate the designated Mother Account
+    const motherAccount = await BankAccount.findOne({
+      isMotherAccount: true,
+    }).session(session);
+    if (!motherAccount) {
+      throw new Error(
+        "No Mother Account designated. Set one in Bank Management."
+      );
+    }
+
     const targetMonth =
       month || new Date().toLocaleString("default", { month: "long" });
     const targetYear = year || new Date().getFullYear();
+    let totalBatchAmount = 0;
 
-    // 3. Process Batch
+    // 2. Process Batch
     const depositResults = await Promise.all(
       userIds.map(async (id) => {
-        // Fetch fresh user data to get current shares and bank account
-        const user = await User.findById(id);
+        const user = await User.findById(id).session(session);
         if (!user) return null;
 
         const amount = (user.shares || 1) * 1000;
+        totalBatchAmount += amount;
 
-        /**
-         * 🚀 SNAPSHOT LOGIC:
-         * We save the bank account directly into the remarks or a dedicated field.
-         * This prevents "No A/C" issues in future audit reports.
-         */
-        const snapshotRemarks = remarks
-          ? `${remarks} (A/C: ${user.bankAccount || "N/A"})`
-          : `Monthly deposit for ${targetMonth} ${targetYear} | A/C: ${
-              user.bankAccount || "N/A"
-            }`;
-
-        // Create Ledger Entry
-        const newDeposit = await Transaction.create({
-          user: id,
-          type: "deposit",
-          category: "monthly_deposit",
-          subcategory: "Member Monthly Share", // Integrated subcategory
-          amount,
-          month: targetMonth,
-          year: targetYear,
-          recordedBy: req.user.id,
-          // ✅ Store the A/C in remarks so it is always visible in the database
-          remarks: `${remarks || "Monthly Deposit"}`,
-        });
-
-        // 4. Aggregate Real-time Balance for the Receipt
-        const totalHistory = await Transaction.aggregate([
-          {
-            $match: {
-              user: user._id,
+        // Create transaction linked to Mother Account
+        const newDeposit = await Transaction.create(
+          [
+            {
+              user: id,
               type: "deposit",
               category: "monthly_deposit",
+              subcategory: "Member Monthly Share",
+              amount,
+              month: targetMonth,
+              year: targetYear,
+              bankAccount: motherAccount._id, // Auto-link
+              recordedBy: req.user.id,
+              remarks: `${remarks || "Monthly Deposit"}`,
             },
-          },
-          { $group: { _id: null, total: { $sum: "$amount" } } },
-        ]);
-
-        // 5. Professional Email Dispatch (Non-blocking)
-        sendDepositEmail(user.email, {
-          name: user.name,
-          amount,
-          totalBalance: totalHistory[0]?.total || amount,
-          date: new Date().toLocaleDateString("en-GB"),
-          period: `${targetMonth} ${targetYear}`,
-          bankAccount: user.bankAccount || "Not Linked",
-        }).catch((err) =>
-          console.error(`Email dispatch failed for ${user.name}:`, err.message)
+          ],
+          { session }
         );
 
         return newDeposit;
       })
     );
 
-    // 6. Finalize Response
-    const successCount = depositResults.filter((r) => r).length;
+    // 3. Increment Mother Account balance automatically
+    motherAccount.currentBalance += totalBatchAmount;
+    await motherAccount.save({ session });
+
+    await session.commitTransaction();
+    session.endSession();
 
     res.status(201).json({
       success: true,
-      count: successCount,
-      message: `Batch complete: ${successCount} ledger entries created and receipts queued.`,
+      message: `Batch complete. ৳${totalBatchAmount.toLocaleString()} added to ${
+        motherAccount.bankName
+      }.`,
     });
   } catch (error) {
-    console.error("Batch Processing Error:", error.message);
-    res.status(500).json({
-      success: false,
-      error: "Internal Server Error during batch processing.",
-    });
+    await session.abortTransaction();
+    session.endSession();
+    res.status(500).json({ success: false, error: error.message });
   }
 };
 

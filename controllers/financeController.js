@@ -678,11 +678,16 @@ exports.getCollectionTrend = async (req, res) => {
  * @route   GET /api/finance/member-summary
  * @access  Private (Member/Admin)
  */
+/**
+ * @desc    Get member-specific dashboard stats (Synced with Modern UI)
+ * @route   GET /api/finance/member-summary
+ * @access  Private (Member/Admin)
+ */
 exports.getMemberSummary = async (req, res) => {
   try {
-    const userId = req.user.id; // From authMiddleware
+    const userId = req.user.id;
 
-    // Calculate ONLY this specific member's total deposits
+    // 1. Personal Savings (Net Liquidity)
     const personalStats = await Transaction.aggregate([
       {
         $match: { user: new mongoose.Types.ObjectId(userId), type: "deposit" },
@@ -690,11 +695,41 @@ exports.getMemberSummary = async (req, res) => {
       { $group: { _id: null, total: { $sum: "$amount" } } },
     ]);
 
+    // 2. Bank Accounts (Society Mother Account)
+    const motherAccount = await BankAccount.findOne({ isMotherAccount: true });
+
+    // 3. Active Investments (Society Level)
+    const activeInvestment = await Investment.findOne({
+      status: "active",
+    }).sort({ createdAt: -1 });
+
+    // 4. User Details for Shares & Member ID
+    const userDetails = await User.findById(userId).select("shares phone");
+
     res.status(200).json({
       success: true,
       data: {
-        totalDeposited: personalStats[0]?.total || 0,
-        bankBalance: personalStats[0]?.total || 0, // Member's personal fund
+        // Stats for the 4 top cards
+        netLiquidity: personalStats[0]?.total || 0,
+        societyShares: userDetails?.shares || 0,
+        memberId: userDetails?.phone || "N/A",
+
+        // Bank Data
+        bankAccount: {
+          bankName: motherAccount?.bankName || "Society Treasury",
+          branch: motherAccount?.branchName || "Main Branch",
+          accountNumber: motherAccount?.accountNumber || "****2453",
+          balance: motherAccount?.currentBalance || 0,
+        },
+
+        // Investment Data
+        activeInvestment: {
+          name: activeInvestment?.projectName || "No Active Projects",
+          amount: activeInvestment?.amount || 0,
+          category: activeInvestment?.investmentType || "Project Capital",
+        },
+
+        // Personal Registry List
         recentTransactions: await Transaction.find({ user: userId })
           .sort({ date: -1 })
           .limit(5)
@@ -702,9 +737,11 @@ exports.getMemberSummary = async (req, res) => {
       },
     });
   } catch (error) {
-    res
-      .status(500)
-      .json({ success: false, message: "Personal summary failed" });
+    res.status(500).json({
+      success: false,
+      message: "Dashboard data sync failed",
+      error: error.message,
+    });
   }
 };
 

@@ -167,7 +167,7 @@ exports.getAdminSummary = async (req, res) => {
     // 2. Get Investment Stats
     const investmentStats = await Investment.aggregate([
       { $match: { status: "active" } },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
+      { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } },
     ]);
 
     // 3. Count Active Members
@@ -177,14 +177,28 @@ exports.getAdminSummary = async (req, res) => {
     });
 
     /**
-     * 🚀 NEW: Aggregate Total Society Shares
-     * Sums the 'shares' field from all active users
+     * 🚀 AGGREGATE: Total Society Shares
      */
     const shareStats = await User.aggregate([
       { $match: { status: "active" } },
       { $group: { _id: null, totalShares: { $sum: "$shares" } } },
     ]);
     const totalSharesCount = shareStats[0]?.totalShares || 0;
+
+    /**
+     * 🚀 BRANCH PERFORMANCE: Sum deposits per branch [cite: 2025-10-11]
+     */
+    const branchStatsRaw = await User.aggregate([
+      { $match: { role: "member", status: "active" } },
+      { $group: { _id: "$branch", collection: { $sum: "$totalDeposited" } } },
+    ]);
+
+    const branchStats = branchStatsRaw.map((b) => ({
+      name: b._id || "Unassigned",
+      collection: b.collection,
+      // Logic: Calculate progress against a theoretical target (e.g., 500,000 BDT) [cite: 2025-10-11]
+      progress: Math.min(Math.round((b.collection / 500000) * 100), 100),
+    }));
 
     // 4. Get Recent Activity
     const recentTransactions = await Transaction.find()
@@ -196,15 +210,20 @@ exports.getAdminSummary = async (req, res) => {
     // 5. Generate Trend Data
     const trend = await this.getInternalTrendData();
 
-    // 6. Final Response
+    // 6. ✅ FINAL RESPONSE: Wrapped in 'data' object for frontend compatibility [cite: 2025-10-11]
     res.status(200).json({
       success: true,
-      totalMembers,
-      totalSharesCount, // 🔥 Added for Main Dashboard
-      totalCollection: totalLiquidity,
-      totalInvestments: investmentStats[0]?.total || 0,
-      recentTransactions,
-      collectionTrend: trend,
+      data: {
+        totalNetWorth: totalLiquidity, // Matches heroAmount in AdminDashboard
+        totalMembers, // Matches gridValue in AdminDashboard
+        totalShares: totalSharesCount,
+        activeProjects: investmentStats[0]?.count || 0, // Matches gridValue
+        totalInvestments: investmentStats[0]?.total || 0,
+        recentTransactions, // Matches Global Activity Log
+        branchStats, // Matches Branch Performance Slider
+        collectionTrend: trend,
+        monthlyGrowth: 25000, // Placeholder for the +৳ trend text
+      },
     });
   } catch (error) {
     res.status(500).json({ success: false, error: error.message });

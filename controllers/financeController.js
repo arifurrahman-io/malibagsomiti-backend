@@ -687,7 +687,7 @@ exports.getMemberSummary = async (req, res) => {
   try {
     const userId = req.user.id;
 
-    // 1. Personal Savings (Net Liquidity)
+    // 1. Personal Savings (Net Liquidity card)
     const personalStats = await Transaction.aggregate([
       {
         $match: { user: new mongoose.Types.ObjectId(userId), type: "deposit" },
@@ -695,13 +695,24 @@ exports.getMemberSummary = async (req, res) => {
       { $group: { _id: null, total: { $sum: "$amount" } } },
     ]);
 
-    // 2. Bank Accounts (Society Mother Account)
-    const motherAccount = await BankAccount.findOne({ isMotherAccount: true });
+    /**
+     * 2. Bank Accounts (Sliding Data)
+     * Changed from findOne to find() to support multiple accounts (Savings, Current, FDR)
+     *
+     */
+    const bankAccounts = await BankAccount.find({
+      $or: [{ isMotherAccount: true }, { currentBalance: { $gt: 0 } }],
+    }).lean();
 
-    // 3. Active Investments (Society Level)
-    const activeInvestment = await Investment.findOne({
+    /**
+     * 3. Active Investments (Sliding Data)
+     * Changed from findOne to find() to support multiple active projects [cite: 2025-10-11]
+     */
+    const investments = await Investment.find({
       status: "active",
-    }).sort({ createdAt: -1 });
+    })
+      .sort({ createdAt: -1 })
+      .lean();
 
     // 4. User Details for Shares & Member ID
     const userDetails = await User.findById(userId).select("shares phone");
@@ -709,25 +720,29 @@ exports.getMemberSummary = async (req, res) => {
     res.status(200).json({
       success: true,
       data: {
-        // Stats for the 4 top cards
+        // Top Card Stats
         netLiquidity: personalStats[0]?.total || 0,
         societyShares: userDetails?.shares || 0,
         memberId: userDetails?.phone || "N/A",
 
-        // Bank Data
-        bankAccount: {
-          bankName: motherAccount?.bankName || "Society Treasury",
-          branch: motherAccount?.branchName || "Main Branch",
-          accountNumber: motherAccount?.accountNumber || "****2453",
-          balance: motherAccount?.currentBalance || 0,
-        },
+        /**
+         * 5. Arrays for sliding components [cite: 2025-10-11]
+         * These keys must match your Dashboard.jsx FlatList data props
+         */
+        bankAccounts: bankAccounts.map((acc) => ({
+          _id: acc._id,
+          bankName: acc.bankName,
+          accountNumber: acc.accountNumber || "****2453",
+          currentBalance: acc.currentBalance || 0,
+          accountType: acc.accountType || "SAVINGS",
+        })),
 
-        // Investment Data
-        activeInvestment: {
-          name: activeInvestment?.projectName || "No Active Projects",
-          amount: activeInvestment?.amount || 0,
-          category: activeInvestment?.investmentType || "Project Capital",
-        },
+        investments: investments.map((inv) => ({
+          _id: inv._id,
+          projectName: inv.projectName,
+          amount: inv.amount || 0,
+          investmentType: inv.investmentType || "Project Capital",
+        })),
 
         // Personal Registry List
         recentTransactions: await Transaction.find({ user: userId })

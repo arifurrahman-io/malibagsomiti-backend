@@ -33,12 +33,7 @@ app.use(
   })
 );
 
-app.use(
-  cors({
-    origin: process.env.CLIENT_URL || "http://localhost:3000",
-    credentials: true,
-  })
-);
+app.use(cors()); // এটি সব ধরণের অরিজিন এলাউ করবে
 
 app.use(compression());
 app.use(express.json());

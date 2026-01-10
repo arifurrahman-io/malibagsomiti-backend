@@ -219,7 +219,7 @@ exports.getAdminSummary = async (req, res) => {
 
     // 2. Investment Portfolio Stats
     const investmentStats = await Investment.aggregate([
-      { $match: { status: "Active" } },
+      { $match: { status: "active" } },
       {
         $group: {
           _id: null,

@@ -115,6 +115,8 @@ router.get(
   getBranchSummary
 );
 
+router.get("/history/:id", getMemberHistory);
+
 /**
  * @section Super-Admin Management & Full Audit
  */
@@ -138,6 +140,5 @@ router.get(
 );
 
 // Member-Specific History Lookup
-router.get("/history/:id", getMemberHistory);
 
 module.exports = router;

@@ -4,39 +4,51 @@ const Investment = require("../models/Investment");
 const mongoose = require("mongoose");
 
 /**
- * @desc    লগইন করা মেম্বারের নিজস্ব লেনদেন দেখা
- * @route   GET /api/finance/transaction/my-history
- * @access  Private (Member/Admin)
+ * ✅ GET MEMBER TRANSACTIONS: Optimized for Mobile Infinite Scroll
+ * Supports both personal view and admin-member audit [cite: 2025-10-11].
  */
 exports.getMemberTransactions = async (req, res) => {
   try {
-    // শুধুমাত্র লগইন করা ইউজারের আইডি দিয়ে ট্রাঞ্জেকশন ফিল্টার করা
-    // আপনার মডেল অনুযায়ী 'user' ফিল্ডটি চেক করে নিন
+    const { page = 1, limit = 15 } = req.query; // Pagination for smooth scrolling
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+
     const transactions = await Transaction.find({ user: req.user.id })
       .populate("bankAccount", "bankName accountNumber")
-      .sort({ date: -1 });
+      .sort({ date: -1 })
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
 
+    const total = await Transaction.countDocuments({ user: req.user.id });
+
+    /**
+     * 🚀 APP SYNC:
+     * Returns a pagination object so the React Native FlatList knows when to stop.
+     */
     res.status(200).json({
       success: true,
       count: transactions.length,
+      pagination: {
+        total,
+        currentPage: parseInt(page),
+        hasNextPage: skip + transactions.length < total,
+      },
       data: transactions,
     });
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: "লেনদেনের তথ্য পাওয়া যায়নি।",
+      message: "লেনদেনের তথ্য পাওয়া যায়নি।",
       error: error.message,
     });
   }
 };
 
 /**
- * @desc    Create a financial entry synced with Mother Account & Investment Projects
- * @route   POST /api/finance/transaction
- * @access  Private (Admin/Super-Admin)
+ * ✅ CREATE TRANSACTION: Atomic Triple-Sync Logic
+ * Synchronizes: 1. Ledger, 2. Bank Balance, 3. Project ROI [cite: 2025-10-11].
  */
 exports.createTransaction = async (req, res) => {
-  // 1. Start a Session for Atomic Updates across three collections
   const session = await mongoose.startSession();
   session.startTransaction();
 
@@ -54,7 +66,7 @@ exports.createTransaction = async (req, res) => {
       bankAccount,
     } = req.body;
 
-    // 2. Strict Validation
+    // 1. Strict Validation
     if (!type || !category || !amount || !bankAccount) {
       return res.status(400).json({
         success: false,
@@ -62,86 +74,76 @@ exports.createTransaction = async (req, res) => {
       });
     }
 
-    // 3. Verify target Bank Account (Mother Account)
+    // 2. Verify target Bank (Mother Account)
     const targetBank = await BankAccount.findById(bankAccount).session(session);
     if (!targetBank) {
-      throw new Error("Target treasury account not found in the registry.");
+      throw new Error("Target treasury account not found.");
     }
 
     const numAmount = Number(amount);
 
-    // 4. 🔥 INVESTMENT ROI TRACKING LOGIC
+    // 3. 🔥 INVESTMENT ROI TRACKING (For Bento Grid dynamic updates)
     if (category.toLowerCase().includes("investment") && subcategory) {
       const project = await Investment.findOne({
         projectName: subcategory,
       }).session(session);
-
       if (project) {
-        if (type === "deposit") {
-          project.totalProfit += numAmount;
-        } else if (type === "expense") {
-          project.totalProfit -= numAmount;
-        }
+        if (type === "deposit") project.totalProfit += numAmount;
+        else if (type === "expense") project.totalProfit -= numAmount;
         await project.save({ session });
       }
     }
 
-    // 5. Determine Date and Period
+    // 4. Period Normalization (Critical for App History filtering) [cite: 2025-10-11]
     const transactionDate = date ? new Date(date) : new Date();
+    const finalMonth =
+      month || transactionDate.toLocaleString("default", { month: "long" });
+    const finalYear = year || transactionDate.getFullYear();
 
-    // 6. Create Transaction Record
+    // 5. Create Transaction Record
     const transaction = await Transaction.create(
       [
         {
-          user: userId || null, // মেম্বারের আইডি এখানে সেভ হচ্ছে
+          user: userId || null,
           type,
           category,
           subcategory,
           amount: numAmount,
           date: transactionDate,
-          month: month || null,
-          year: year || null,
+          month: finalMonth,
+          year: finalYear,
           bankAccount,
-          remarks:
-            remarks ||
-            `${type} entry for ${category} (${subcategory || "General"})`,
+          remarks: remarks || `${type} entry for ${category}`,
           recordedBy: req.user.id,
         },
       ],
       { session }
     );
 
-    // 7. SYNC MOTHER ACCOUNT BALANCE
+    // 6. SYNC MOTHER ACCOUNT (Real-time Liquidity)
     if (type === "deposit") {
       targetBank.currentBalance += numAmount;
-    } else if (type === "expense") {
+    } else {
       if (targetBank.currentBalance < numAmount) {
-        throw new Error(
-          `Insufficient funds in ${targetBank.bankName}. Current: ${targetBank.currentBalance}`
-        );
+        throw new Error(`Insufficient funds in ${targetBank.bankName}.`);
       }
       targetBank.currentBalance -= numAmount;
     }
 
     await targetBank.save({ session });
 
-    // 8. Commit changes
+    // 7. Success Response
     await session.commitTransaction();
     session.endSession();
 
     res.status(201).json({
       success: true,
+      message: "Registry synchronized across all accounts.",
       data: transaction[0],
-      message: `Ledger synchronized, Bank balance updated, and Project ROI calculated.`,
     });
   } catch (error) {
-    // 9. Rollback
     await session.abortTransaction();
     session.endSession();
-
-    res.status(400).json({
-      success: false,
-      message: error.message,
-    });
+    res.status(400).json({ success: false, message: error.message });
   }
 };

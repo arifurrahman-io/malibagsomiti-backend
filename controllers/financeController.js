@@ -1448,7 +1448,7 @@ exports.getMemberHistory = async (req, res) => {
   try {
     const userId = req.params.id || req.user.id;
 
-    // 1. FETCH USER & CALCULATE AGGREGATE STATS IN PARALLEL
+    // 1. FETCH USER & CALCULATE AGGREGATE STATS IN PARALLEL [cite: 2026-01-10]
     const [user, totalStats, historyData] = await Promise.all([
       User.findById(userId)
         .select(
@@ -1467,7 +1467,7 @@ exports.getMemberHistory = async (req, res) => {
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ]),
 
-      // Fetch Paginated Transactions
+      // Fetch All Transactions
       Transaction.find({ user: userId })
         .sort({ date: -1 })
         .populate("recordedBy", "name")
@@ -1481,8 +1481,7 @@ exports.getMemberHistory = async (req, res) => {
         .json({ success: false, message: "Member not found." });
     }
 
-    // Determine the true contribution:
-    // Use aggregate sum if available, otherwise fallback to user record
+    // Determine the true contribution sum [cite: 2026-01-10]
     const realTotalContribution =
       totalStats.length > 0 ? totalStats[0].total : user.totalDeposited || 0;
 
@@ -1496,18 +1495,25 @@ exports.getMemberHistory = async (req, res) => {
           avatar: user.profilePicture || null,
           branch: user.branch,
           shares: user.shares || 0,
-          totalContribution: realTotalContribution, // 🔥 Now dynamically calculated
+          totalContribution: realTotalContribution,
           joiningDate: user.joiningDate,
           accountStatus: user.status.toUpperCase(),
           lastActivity: historyData.length > 0 ? historyData[0].date : null,
         },
+        // Mapping history to ensure month/year are visible to all roles
         transactions: historyData.map((t) => ({
           id: t._id,
-          title: t.category || "General Entry",
-          subtitle: t.subcategory || t.remarks || "No additional details",
+          category: t.category || "General Entry",
+          subcategory: t.subcategory || "Regular Registry",
+          remarks: t.remarks || "",
           amount: t.amount,
           type: t.type,
           isDeposit: t.type === "deposit",
+
+          // ✅ CRITICAL FIX: Explicitly passing month and year strings
+          month: t.month,
+          year: t.year,
+
           date: t.date,
           formattedDate: new Date(t.date).toLocaleDateString("en-GB", {
             day: "2-digit",

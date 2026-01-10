@@ -210,7 +210,8 @@ exports.addExpense = async (req, res) => {
 exports.getAdminSummary = async (req, res) => {
   try {
     // 1. Fetch Society Liquidity (Total of all Bank Accounts)
-    const accounts = await BankAccount.find();
+    // Using lean() for faster read performance on the dashboard
+    const accounts = await BankAccount.find().lean();
     const totalLiquidity = accounts.reduce(
       (sum, acc) => sum + (acc.currentBalance || 0),
       0
@@ -218,8 +219,14 @@ exports.getAdminSummary = async (req, res) => {
 
     // 2. Investment Portfolio Stats
     const investmentStats = await Investment.aggregate([
-      { $match: { status: "active" } },
-      { $group: { _id: null, total: { $sum: "$amount" }, count: { $sum: 1 } } },
+      { $match: { status: "Active" } },
+      {
+        $group: {
+          _id: null,
+          totalCapital: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
     ]);
 
     // 3. Member & Share Metrics
@@ -229,81 +236,110 @@ exports.getAdminSummary = async (req, res) => {
     });
 
     const shareStats = await User.aggregate([
-      { $match: { status: "active" } },
+      { $match: { status: "active", role: "member" } },
       { $group: { _id: null, totalShares: { $sum: "$shares" } } },
     ]);
     const totalSharesCount = shareStats[0]?.totalShares || 0;
 
     /**
-     * 🚀 FIXED BRANCH PERFORMANCE AGGREGATION
-     * We match active members and group by branch name.
+     * 🚀 4. BRANCH PERFORMANCE AGGREGATION (Atomic & Real-time)
+     * Instead of relying on User.totalDeposited, we calculate from the Transaction ledger.
+     * This ensures the Progress Bar is 100% accurate [cite: 2025-10-11].
      */
-    const branchStatsRaw = await User.aggregate([
+    const branchStats = await User.aggregate([
+      { $match: { role: "member", status: "active" } },
       {
-        $match: {
-          role: "member",
-          status: "active",
+        $lookup: {
+          from: "transactions",
+          localField: "_id",
+          foreignField: "user",
+          as: "memberTransactions",
+        },
+      },
+      {
+        $project: {
+          branch: 1,
+          deposits: {
+            $filter: {
+              input: "$memberTransactions",
+              as: "tx",
+              cond: { $eq: ["$$tx.type", "deposit"] },
+            },
+          },
         },
       },
       {
         $group: {
           _id: "$branch",
-          totalCollection: { $sum: "$totalDeposited" },
+          collection: { $sum: { $sum: "$deposits.amount" } },
         },
       },
-      { $sort: { totalCollection: -1 } }, // Sort by highest performing branch
+      {
+        $project: {
+          name: { $ifNull: ["$_id", "General"] },
+          collection: 1,
+          // Calculate progress against a target (e.g., ৳500,000)
+          progress: {
+            $min: [
+              {
+                $round: [
+                  { $multiply: [{ $divide: ["$collection", 500000] }, 100] },
+                  0,
+                ],
+              },
+              100,
+            ],
+          },
+        },
+      },
+      { $sort: { collection: -1 } },
     ]);
 
-    // Map raw data to the format required by the AdminDashboard UI [cite: 2025-10-11]
-    const branchStats = branchStatsRaw.map((b) => {
-      const collectionAmount = b.totalCollection || 0;
-      // Define a dynamic target for the progress bar (e.g., 500,000 BDT) [cite: 2025-10-11]
-      const branchTarget = 500000;
-
-      return {
-        name: b._id || "Unassigned", // Display "Unassigned" if branch is null in DB
-        collection: collectionAmount,
-        progress: Math.min(
-          Math.round((collectionAmount / branchTarget) * 100),
-          100
-        ),
-      };
-    });
-
-    // 4. Global Recent Activity Log
+    // 5. Global Recent Activity Log
     const recentTransactions = await Transaction.find()
       .sort({ date: -1 })
       .limit(8)
       .populate("user", "name")
       .lean();
 
-    // 5. Historical Trends
-    // Assuming this.getInternalTrendData() is defined elsewhere in your controller
-    let trend = 0;
-    try {
-      trend = await this.getInternalTrendData();
-    } catch (e) {
-      trend = 0; // Fallback if trend logic fails
-    }
+    // 6. Calculate Monthly Growth Trend [cite: 2025-10-11]
+    const currentMonth = new Date().toLocaleString("default", {
+      month: "long",
+    });
+    const currentYear = new Date().getFullYear();
 
-    // 6. ✅ STRUCTURED RESPONSE: Wrapped for AdminDashboard frontend compatibility [cite: 2025-10-11]
+    const monthlyGrowth = await Transaction.aggregate([
+      {
+        $match: {
+          type: "deposit",
+          month: currentMonth,
+          year: currentYear,
+        },
+      },
+      { $group: { _id: null, total: { $sum: "$amount" } } },
+    ]);
+
+    // 7. ✅ STRUCTURED RESPONSE
     res.status(200).json({
       success: true,
       data: {
-        totalNetWorth: totalLiquidity, // Binds to Hero Amount
-        totalMembers, // Binds to Registry Card
-        totalShares: totalSharesCount, // Binds to Registry Subtext
-        activeProjects: investmentStats[0]?.count || 0, // Binds to Portfolio Card
-        totalInvestments: investmentStats[0]?.total || 0,
-        recentTransactions, // Binds to Global Activity Log
-        branchStats, // Binds to Branch Performance Slider
-        collectionTrend: trend,
-        monthlyGrowth: 25000, // Placeholder for +৳ trend
+        totalNetWorth: totalLiquidity, // Hero Amount
+        totalMembers, // Registry Card Value
+        totalShares: totalSharesCount, // Registry Card Subtext
+        activeProjects: investmentStats[0]?.count || 0, // Portfolio Card Value
+        totalInvestments: investmentStats[0]?.totalCapital || 0,
+        recentTransactions, // Activity Log
+        branchStats: branchStats.length > 0 ? branchStats : [], // Branch Slider
+        monthlyGrowth: monthlyGrowth[0]?.total || 0, // Trend Text
       },
     });
   } catch (error) {
-    console.error("Dashboard Aggregation Error:", error.message);
-    res.status(500).json({ success: false, error: error.message });
+    console.error("Dashboard Sync Error:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Governance data failed to synchronize.",
+      error: error.message,
+    });
   }
 };
 

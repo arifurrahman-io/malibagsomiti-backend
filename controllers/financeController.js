@@ -1423,62 +1423,94 @@ exports.getMemberSummary = async (req, res) => {
  */
 exports.getMemberHistory = async (req, res) => {
   try {
-    // 1. Identify Target User
+    /**
+     * 1. IDENTIFY TARGET USER
+     * If an admin provides an ID in params, use it.
+     * Otherwise, fallback to the logged-in user's ID (Member View).
+     */
     const userId = req.params.id || req.user.id;
 
-    // 2. Fetch User Profile for Summary Header
+    // 2. FETCH USER PROFILE
+    // We fetch updated stats to ensure the Header always shows real-time data [cite: 2025-10-11]
     const user = await User.findById(userId)
-      .select("name totalDeposited shares branch joiningDate status")
+      .select(
+        "name totalDeposited shares branch joiningDate status profilePicture"
+      )
       .lean();
+
     if (!user) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Member record not found." });
+      return res.status(404).json({
+        success: false,
+        message: "Member record not found.",
+      });
     }
 
-    // 3. Fetch Paginated Transactions
-    const { page = 1, limit = 20 } = req.query;
+    // 3. PAGINATION & FILTERING LOGIC
+    const { page = 1, limit = 20, type } = req.query; // Allow filtering by 'deposit' or 'expense'
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const history = await Transaction.find({ user: userId })
-      .sort({ date: -1 })
-      .populate("recordedBy", "name")
-      .populate("bankAccount", "accountName") // Shows where their money was deposited
-      .skip(skip)
-      .limit(parseInt(limit))
-      .lean();
+    // Build query object
+    let query = { user: userId };
+    if (type) query.type = type;
 
-    const totalCount = await Transaction.countDocuments({ user: userId });
+    // 4. FETCH DATA PARALLEL (Performance Optimization) [cite: 2026-01-10]
+    const [history, totalCount] = await Promise.all([
+      Transaction.find(query)
+        .sort({ date: -1 })
+        .populate("recordedBy", "name")
+        .populate("bankAccount", "bankName accountNumber") // Fixed: use bankName for clarity
+        .skip(skip)
+        .limit(parseInt(limit))
+        .lean(),
+      Transaction.countDocuments(query),
+    ]);
 
     /**
-     * 🚀 DATA NORMALIZATION:
-     * We group the response so the App/Web can show a high-end "Stats Header"
-     * followed by the transaction list [cite: 2025-10-11].
+     * 5. DATA NORMALIZATION & STATS CALCULATION
+     * We calculate quick stats so the mobile app doesn't have to do it [cite: 2025-10-11].
      */
+    const lastTransaction = history.length > 0 ? history[0].date : null;
+
     res.status(200).json({
       success: true,
       data: {
         memberProfile: {
+          id: user._id,
           name: user.name,
+          avatar: user.profilePicture || null,
           branch: user.branch,
           shares: user.shares || 0,
           totalContribution: user.totalDeposited || 0,
           joiningDate: user.joiningDate,
           accountStatus: user.status.toUpperCase(),
+          lastActivity: lastTransaction,
         },
+        // Mapping history for high-end UI "Transaction Cards"
         transactions: history.map((t) => ({
-          ...t,
-          // Format date for regional readability [cite: 2025-10-11]
+          id: t._id,
+          title: t.category || "General Entry",
+          subtitle: t.subcategory || t.remarks || "No additional details",
+          amount: t.amount,
+          type: t.type, // 'deposit' or 'expense'
+          isDeposit: t.type === "deposit",
+          date: t.date,
           formattedDate: new Date(t.date).toLocaleDateString("en-GB", {
             day: "2-digit",
             month: "short",
             year: "numeric",
           }),
-          isDeposit: t.type === "deposit",
+          bank: t.bankAccount
+            ? {
+                name: t.bankAccount.bankName,
+                acc: t.bankAccount.accountNumber?.slice(-4) || "****", // Security: last 4 digits
+              }
+            : null,
+          recordedBy: t.recordedBy?.name || "System",
         })),
         pagination: {
           total: totalCount,
           currentPage: parseInt(page),
+          totalPages: Math.ceil(totalCount / limit),
           hasNextPage: skip + history.length < totalCount,
         },
       },
@@ -1487,7 +1519,7 @@ exports.getMemberHistory = async (req, res) => {
     console.error("Member Ledger Error:", error.message);
     res.status(500).json({
       success: false,
-      message: "Could not retrieve member history.",
+      message: "Internal Server Error: Could not sync personal ledger.",
       error: error.message,
     });
   }

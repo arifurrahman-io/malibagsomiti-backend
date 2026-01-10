@@ -149,6 +149,9 @@ router.get(
   getAllTransactions
 );
 
-// Member-Specific History Lookup
+router.get("/history/me", getMemberHistory);
+
+// Global/Specific History Lookup
+router.get("/history/:id", getMemberHistory);
 
 module.exports = router;

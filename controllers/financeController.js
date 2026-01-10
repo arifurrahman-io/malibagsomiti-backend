@@ -1500,27 +1500,19 @@ exports.getMemberHistory = async (req, res) => {
  */
 exports.getInvestmentById = async (req, res) => {
   try {
-    // Populate bank info so we know which account funded the project [cite: 2026-01-10]
+    // We use findById and populate bank info for the bento grid
     const investment = await Investment.findById(req.params.id)
       .populate("bankAccount", "bankName accountNumber")
       .lean();
 
     if (!investment) {
-      return res.status(404).json({
-        success: false,
-        message: "Investment project not found.",
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Project not found" });
     }
 
-    res.status(200).json({
-      success: true,
-      data: investment,
-    });
+    res.status(200).json({ success: true, data: investment });
   } catch (error) {
-    res.status(500).json({
-      success: false,
-      message: "Server Error: Could not fetch project details.",
-      error: error.message,
-    });
+    res.status(500).json({ success: false, error: error.message });
   }
 };

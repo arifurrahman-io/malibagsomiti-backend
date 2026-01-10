@@ -18,7 +18,7 @@ const {
   downloadInvestmentReport,
   getAllTransactions,
   getMemberHistory,
-  getMemberSummary, // Personalized registry list for members
+  getMemberSummary,
 } = require("../controllers/financeController");
 
 const { protect, authorize } = require("../middleware/authMiddleware");
@@ -54,16 +54,9 @@ router.use(protect);
 
 /**
  * @section Administrative Transactions
- * Strictly restricted to Admin/Super-Admin roles.
  */
-
-// Monthly Share Collections
 router.post("/deposit", authorize("admin", "super-admin"), processDeposit);
-
-// Society Expenditures
 router.post("/expense", authorize("admin", "super-admin"), addExpense);
-
-// New Project Registry
 router.post(
   "/investment",
   authorize("admin", "super-admin"),
@@ -71,21 +64,21 @@ router.post(
   addInvestment
 );
 
-// Project Ledger Access
+/**
+ * @section Project & Investment Management
+ */
+router.get("/investments", getAllInvestments);
+router.get("/investment/:id", getInvestmentById);
 router.get(
   "/investment/:id/history",
   authorize("admin", "super-admin"),
   getInvestmentHistory
 );
-
-// Project Yield/ROI Entry
 router.post(
   "/investment/:id/profit",
   authorize("admin", "super-admin"),
   recordInvestmentProfit
 );
-
-// Printable Audit Reports for Projects
 router.get(
   "/investment/:id/report",
   authorize("admin", "super-admin"),
@@ -93,65 +86,46 @@ router.get(
 );
 
 /**
- * @section Dashboard & Analytics
- * Shared routes that allow all users to view global metrics.
+ * @section Analytics & Summaries
  */
-
-// 🔥 GLOBAL SUMMARY: Accessible to all roles so Society Net Liquidity shows correctly [cite: 2025-10-11]
 router.get("/summary", getAdminSummary);
-
-// PERSONAL REGISTRY: Fetches user-specific history for the dashboard sidebar
-router.get("/member-summary", getMemberSummary);
-
-// Registry Integrity Check
-router.get("/check-payments", authorize("admin", "super-admin"), checkPayments);
-
-// Portfolio Overview (Visible to everyone for transparency)
-router.get("/investments", getAllInvestments);
-
-router.get("/investment/:id", getInvestmentById);
-
-// Project Ledger Access
-router.get(
-  "/investment/:id/history",
-  authorize("admin", "super-admin"),
-  getInvestmentHistory
-);
-
-// Regional Analytics
 router.get(
   "/summary/:branch",
   authorize("admin", "super-admin"),
   getBranchSummary
 );
-
-router.get("/history/:id", getMemberHistory);
+router.get("/member-summary", getMemberSummary);
+router.get("/check-payments", authorize("admin", "super-admin"), checkPayments);
 
 /**
- * @section Super-Admin Management & Full Audit
+ * @section Transaction History (Order Matters!)
+ * 🚀 Fixed: Static routes must come BEFORE parameterized routes to avoid 500 errors.
  */
 
-// Project Updates & Legal Doc Modifications
-router.put(
-  "/investment/:id",
-  authorize("super-admin"),
-  upload.single("legalDocs"),
-  updateInvestment
-);
-
-// Permanent Project Deletion
-router.delete("/investment/:id", authorize("super-admin"), deleteInvestment);
-
-// Full Historical Registry (Admin Audit View)
+// 1. Admin/Super-Admin Full Audit
 router.get(
   "/all-transactions",
   authorize("admin", "super-admin"),
   getAllTransactions
 );
 
+// 2. Personal History (For the logged-in Member)
+// Express will check this first when the URL is /history/me
 router.get("/history/me", getMemberHistory);
 
-// Global/Specific History Lookup
-router.get("/history/:id", getMemberHistory);
+// 3. Member Lookup (For Admins to see specific user history)
+// Express will check this if the URL is /history/65a123...
+router.get("/history/:id", authorize("admin", "super-admin"), getMemberHistory);
+
+/**
+ * @section Super-Admin Project Management
+ */
+router.put(
+  "/investment/:id",
+  authorize("super-admin"),
+  upload.single("legalDocs"),
+  updateInvestment
+);
+router.delete("/investment/:id", authorize("super-admin"), deleteInvestment);
 
 module.exports = router;

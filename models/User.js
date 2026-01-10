@@ -22,7 +22,7 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: [true, "Please add a password"],
       minlength: 6,
-      select: false, // Automatically excludes password from queries for security
+      select: false,
     },
     phone: {
       type: String,
@@ -33,7 +33,24 @@ const userSchema = new mongoose.Schema(
       required: [true, "Please add an NID number"],
       unique: true,
     },
-    bankAccount: { type: String },
+    // 🔥 FINANCIAL TRACKING FIELDS [cite: 2026-01-10]
+    totalDeposited: {
+      type: Number,
+      default: 0, // This is what your HistoryScreen reads
+    },
+    shares: {
+      type: Number,
+      default: 1,
+      min: [1, "Member must have at least 1 share"],
+    },
+    monthlySubscription: {
+      type: Number,
+      default: 1000, // Cost per share
+    },
+    profilePicture: {
+      type: String,
+      default: null,
+    },
     role: {
       type: String,
       enum: ["member", "admin", "super-admin"],
@@ -52,15 +69,6 @@ const userSchema = new mongoose.Schema(
       ],
       index: true,
     },
-    shares: {
-      type: Number,
-      default: 1,
-      min: [1, "Member must have at least 1 share"],
-    },
-    monthlySubscription: {
-      type: Number,
-      default: 1000,
-    },
     joiningDate: {
       type: Date,
       default: Date.now,
@@ -71,14 +79,22 @@ const userSchema = new mongoose.Schema(
       default: "active",
     },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
 );
 
-// --- PASSWORD ENCRYPTION MIDDLEWARE ---
+// --- VIRTUALS for Dynamic UI [cite: 2025-10-11] ---
 /**
- * Modern Mongoose pre-save hook using async/await.
- * Removed 'next' to prevent "TypeError: next is not a function".
+ * Automatically calculates how much the member should pay per month
  */
+userSchema.virtual("requiredMonthlyPayment").get(function () {
+  return this.shares * this.monthlySubscription;
+});
+
+// --- PASSWORD ENCRYPTION MIDDLEWARE ---
 userSchema.pre("save", async function () {
   if (!this.isModified("password")) {
     return;
@@ -88,7 +104,6 @@ userSchema.pre("save", async function () {
 });
 
 // --- HELPER METHOD ---
-// Compares entered password with the hashed password in the database
 userSchema.methods.matchPassword = async function (enteredPassword) {
   return await bcrypt.compare(enteredPassword, this.password);
 };

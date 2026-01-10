@@ -1367,6 +1367,22 @@ exports.getMemberSummary = async (req, res) => {
   try {
     const userId = req.user.id;
 
+    const globalStats = await Transaction.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalIncome: {
+            $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] },
+          },
+          totalExpense: {
+            $sum: { $cond: [{ $eq: ["$type", "expense"] }, "$amount", 0] },
+          },
+        },
+      },
+    ]);
+
+    const globalData = globalStats[0] || { totalIncome: 0, totalExpense: 0 };
+
     // 1. Personal Savings (Net Liquidity card)
     const personalStats = await Transaction.aggregate([
       {
@@ -1404,6 +1420,12 @@ exports.getMemberSummary = async (req, res) => {
         netLiquidity: personalStats[0]?.total || 0,
         societyShares: userDetails?.shares || 0,
         memberId: userDetails?.phone || "N/A",
+
+        globalRegistry: {
+          income: globalData.totalIncome,
+          expense: globalData.totalExpense,
+          net: globalData.totalIncome - globalData.totalExpense,
+        },
 
         /**
          * 5. Arrays for sliding components [cite: 2025-10-11]

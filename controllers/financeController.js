@@ -1493,26 +1493,33 @@ exports.getMemberHistory = async (req, res) => {
   }
 };
 
-/**
- * @desc    Get Single Investment Details
- * @route   GET /api/finance/investment/:id
- * @access  Protected
- */
 exports.getInvestmentById = async (req, res) => {
   try {
-    // We use findById and populate bank info for the bento grid
+    // 1. Fetch by ID and populate funding source details
     const investment = await Investment.findById(req.params.id)
       .populate("bankAccount", "bankName accountNumber")
       .lean();
 
+    // 2. Handle missing records to avoid null reference crashes
     if (!investment) {
-      return res
-        .status(404)
-        .json({ success: false, message: "Project not found" });
+      return res.status(404).json({
+        success: false,
+        message: "Investment record not found.",
+      });
     }
 
-    res.status(200).json({ success: true, data: investment });
+    // 3. Structured response for Axios res.data.data
+    res.status(200).json({
+      success: true,
+      data: investment,
+    });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    // 🔥 Logs the exact reason for the 500 error in your terminal
+    console.error("Internal Server Error:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Server Error: Database sync failed.",
+      error: error.message,
+    });
   }
 };

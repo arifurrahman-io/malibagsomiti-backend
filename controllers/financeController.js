@@ -23,25 +23,39 @@ exports.processDeposit = async (req, res) => {
 
   try {
     const { userIds, remarks, month, year } = req.body;
+
+    // 1. Identify Treasury Source (Mother Account)
     const motherAccount = await BankAccount.findOne({
       isMotherAccount: true,
     }).session(session);
 
-    if (!motherAccount) throw new Error("No Mother Account designated.");
+    if (!motherAccount)
+      throw new Error("No Mother Account designated in registry.");
 
     const targetMonth =
       month || new Date().toLocaleString("default", { month: "long" });
     const targetYear = year || new Date().getFullYear();
     let totalBatchAmount = 0;
 
+    // 2. Process Batch with Atomic Updates
     const depositResults = await Promise.all(
       userIds.map(async (id) => {
         const user = await User.findById(id).session(session);
         if (!user) return null;
 
+        // Calculate amount based on shares (Standard ৳1000 per share)
         const amount = (user.shares || 1) * 1000;
         totalBatchAmount += amount;
 
+        // ✅ UPDATE USER RECORD: Physically increment the contribution field
+        // This ensures the "Total Contribution" is never 0 in your UI [cite: 2026-01-10]
+        await User.findByIdAndUpdate(
+          id,
+          { $inc: { totalDeposited: amount } },
+          { session, new: true }
+        );
+
+        // ✅ CREATE TRANSACTION RECORD: Detailed audit trail
         return await Transaction.create(
           [
             {
@@ -52,10 +66,12 @@ exports.processDeposit = async (req, res) => {
               amount,
               month: targetMonth,
               year: targetYear,
-              date: new Date(), // Set current date for trend grouping
+              date: new Date(),
               bankAccount: motherAccount._id,
               recordedBy: req.user.id,
-              remarks: remarks || `Monthly Share: ${targetMonth} ${targetYear}`,
+              remarks:
+                remarks ||
+                `Monthly Share Collection: ${targetMonth} ${targetYear}`,
             },
           ],
           { session }
@@ -63,16 +79,23 @@ exports.processDeposit = async (req, res) => {
       })
     );
 
+    // 3. UPDATE TREASURY BALANCE: Sync with Mother Account
     motherAccount.currentBalance += totalBatchAmount;
     await motherAccount.save({ session });
 
+    // 4. COMMIT & FINALIZE
     await session.commitTransaction();
+
     res.status(201).json({
       success: true,
-      message: `Batch of ৳${totalBatchAmount.toLocaleString()} processed.`,
+      message: `Ledger Synchronized: ৳${totalBatchAmount.toLocaleString()} added to Treasury.`,
+      count: userIds.length,
+      totalProcessed: totalBatchAmount,
     });
   } catch (error) {
+    // Rollback all changes if any single update fails (Database Integrity)
     await session.abortTransaction();
+    console.error("Batch Deposit Failure:", error.message);
     res.status(500).json({ success: false, error: error.message });
   } finally {
     session.endSession();
@@ -1423,54 +1446,47 @@ exports.getMemberSummary = async (req, res) => {
  */
 exports.getMemberHistory = async (req, res) => {
   try {
-    /**
-     * 1. IDENTIFY TARGET USER
-     * If an admin provides an ID in params, use it.
-     * Otherwise, fallback to the logged-in user's ID (Member View).
-     */
     const userId = req.params.id || req.user.id;
 
-    // 2. FETCH USER PROFILE
-    // We fetch updated stats to ensure the Header always shows real-time data [cite: 2025-10-11]
-    const user = await User.findById(userId)
-      .select(
-        "name totalDeposited shares branch joiningDate status profilePicture"
-      )
-      .lean();
+    // 1. FETCH USER & CALCULATE AGGREGATE STATS IN PARALLEL
+    const [user, totalStats, historyData] = await Promise.all([
+      User.findById(userId)
+        .select(
+          "name totalDeposited shares branch joiningDate status profilePicture"
+        )
+        .lean(),
 
-    if (!user) {
-      return res.status(404).json({
-        success: false,
-        message: "Member record not found.",
-      });
-    }
+      // Dynamic Calculation: Sum all 'deposit' type transactions for this user
+      Transaction.aggregate([
+        {
+          $match: {
+            user: new mongoose.Types.ObjectId(userId),
+            type: "deposit",
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]),
 
-    // 3. PAGINATION & FILTERING LOGIC
-    const { page = 1, limit = 20, type } = req.query; // Allow filtering by 'deposit' or 'expense'
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    // Build query object
-    let query = { user: userId };
-    if (type) query.type = type;
-
-    // 4. FETCH DATA PARALLEL (Performance Optimization) [cite: 2026-01-10]
-    const [history, totalCount] = await Promise.all([
-      Transaction.find(query)
+      // Fetch Paginated Transactions
+      Transaction.find({ user: userId })
         .sort({ date: -1 })
         .populate("recordedBy", "name")
-        .populate("bankAccount", "bankName accountNumber") // Fixed: use bankName for clarity
-        .skip(skip)
-        .limit(parseInt(limit))
+        .populate("bankAccount", "bankName accountNumber")
         .lean(),
-      Transaction.countDocuments(query),
     ]);
 
-    /**
-     * 5. DATA NORMALIZATION & STATS CALCULATION
-     * We calculate quick stats so the mobile app doesn't have to do it [cite: 2025-10-11].
-     */
-    const lastTransaction = history.length > 0 ? history[0].date : null;
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Member not found." });
+    }
 
+    // Determine the true contribution:
+    // Use aggregate sum if available, otherwise fallback to user record
+    const realTotalContribution =
+      totalStats.length > 0 ? totalStats[0].total : user.totalDeposited || 0;
+
+    // 2. DATA NORMALIZATION FOR MODERN UI [cite: 2025-10-11]
     res.status(200).json({
       success: true,
       data: {
@@ -1480,18 +1496,17 @@ exports.getMemberHistory = async (req, res) => {
           avatar: user.profilePicture || null,
           branch: user.branch,
           shares: user.shares || 0,
-          totalContribution: user.totalDeposited || 0,
+          totalContribution: realTotalContribution, // 🔥 Now dynamically calculated
           joiningDate: user.joiningDate,
           accountStatus: user.status.toUpperCase(),
-          lastActivity: lastTransaction,
+          lastActivity: historyData.length > 0 ? historyData[0].date : null,
         },
-        // Mapping history for high-end UI "Transaction Cards"
-        transactions: history.map((t) => ({
+        transactions: historyData.map((t) => ({
           id: t._id,
           title: t.category || "General Entry",
           subtitle: t.subcategory || t.remarks || "No additional details",
           amount: t.amount,
-          type: t.type, // 'deposit' or 'expense'
+          type: t.type,
           isDeposit: t.type === "deposit",
           date: t.date,
           formattedDate: new Date(t.date).toLocaleDateString("en-GB", {
@@ -1502,26 +1517,18 @@ exports.getMemberHistory = async (req, res) => {
           bank: t.bankAccount
             ? {
                 name: t.bankAccount.bankName,
-                acc: t.bankAccount.accountNumber?.slice(-4) || "****", // Security: last 4 digits
+                acc: t.bankAccount.accountNumber?.slice(-4) || "****",
               }
             : null,
           recordedBy: t.recordedBy?.name || "System",
         })),
-        pagination: {
-          total: totalCount,
-          currentPage: parseInt(page),
-          totalPages: Math.ceil(totalCount / limit),
-          hasNextPage: skip + history.length < totalCount,
-        },
       },
     });
   } catch (error) {
     console.error("Member Ledger Error:", error.message);
-    res.status(500).json({
-      success: false,
-      message: "Internal Server Error: Could not sync personal ledger.",
-      error: error.message,
-    });
+    res
+      .status(500)
+      .json({ success: false, message: "Server Error", error: error.message });
   }
 };
 

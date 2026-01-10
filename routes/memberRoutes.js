@@ -10,37 +10,35 @@ const {
 } = require("../controllers/memberController");
 const { protect, authorize } = require("../middleware/authMiddleware");
 
-// All member-related operations require a valid JWT session
+// All routes require authentication
 router.use(protect);
 
 /**
- * @desc    Get detailed member profile + Personal Financial Summary
- * @route   GET /api/members/profile/:id?
- * @access  Protected (Member/Admin)
- * 🚀 Note: The ':id?' parameter is now optional.
- * If omitted, the controller uses the logged-in user's ID.
+ * @section User / Member Self-Access
+ * @desc    Get profile for self or specific ID
+ * @route   GET /api/members/profile OR /api/members/profile/:id
  */
-// routes/memberRoutes.js
-// Define the specific ID route first, then the base route
-router.get("/profile/:id", getMemberProfile);
+// 🔥 Use two separate routes instead of the optional '?' which causes the crash
 router.get("/profile", getMemberProfile);
+router.get("/profile/:id", getMemberProfile);
 
 /**
  * @section Administrative Governance
- * @access  Restricted to Admin & Super-Admin roles
+ * @access  Restricted to Admin & Super-Admin roles [cite: 2025-10-11]
  */
 
-// Bulk member registry management
+// 1. Bulk Member Management
 router
   .route("/")
-  .get(authorize("admin", "super-admin"), getAllMembers) // Fetch searchable member directory
-  .post(authorize("admin", "super-admin"), createMember); // Register new society member
+  .get(authorize("admin", "super-admin"), getAllMembers)
+  .post(authorize("admin", "super-admin"), createMember);
 
-// Specific member record modifications
+// 2. Standard CRUD for Single Member Records
 router
   .route("/:id")
-  .put(authorize("admin", "super-admin"), updateMember) // Update verified credentials or share units
-  .patch(authorize("admin", "super-admin"), toggleStatus) // Deactivate/Reactivate account registry
-  .delete(authorize("super-admin"), deleteMember); // Permanent removal (Super-Admin only)
+  .get(authorize("admin", "super-admin"), getMemberProfile) // Fixes your 404 for Admin viewing Profile
+  .put(authorize("admin", "super-admin"), updateMember)
+  .patch(authorize("admin", "super-admin"), toggleStatus)
+  .delete(authorize("super-admin"), deleteMember);
 
 module.exports = router;

@@ -12,6 +12,7 @@ const {
   checkPayments,
   getAllInvestments,
   getInvestmentHistory,
+  getInvestmentById,
   updateInvestment,
   deleteInvestment,
   downloadInvestmentReport,
@@ -107,6 +108,15 @@ router.get("/check-payments", authorize("admin", "super-admin"), checkPayments);
 
 // Portfolio Overview (Visible to everyone for transparency)
 router.get("/investments", getAllInvestments);
+
+router.get("/investment/:id", getInvestmentById);
+
+// Project Ledger Access
+router.get(
+  "/investment/:id/history",
+  authorize("admin", "super-admin"),
+  getInvestmentHistory
+);
 
 // Regional Analytics
 router.get(

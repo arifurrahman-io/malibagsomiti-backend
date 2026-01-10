@@ -1492,3 +1492,35 @@ exports.getMemberHistory = async (req, res) => {
     });
   }
 };
+
+/**
+ * @desc    Get Single Investment Details
+ * @route   GET /api/finance/investment/:id
+ * @access  Protected
+ */
+exports.getInvestmentById = async (req, res) => {
+  try {
+    // Populate bank info so we know which account funded the project [cite: 2026-01-10]
+    const investment = await Investment.findById(req.params.id)
+      .populate("bankAccount", "bankName accountNumber")
+      .lean();
+
+    if (!investment) {
+      return res.status(404).json({
+        success: false,
+        message: "Investment project not found.",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      data: investment,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Server Error: Could not fetch project details.",
+      error: error.message,
+    });
+  }
+};

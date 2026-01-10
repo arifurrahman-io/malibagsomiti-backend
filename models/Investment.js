@@ -11,11 +11,17 @@ const investmentSchema = new mongoose.Schema(
       type: Number,
       required: true,
       min: 0,
-    }, // Initial capital invested
+    },
+    // 🔥 ADD THIS FIELD: Reference to the BankAccount model
+    bankAccount: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "BankAccount",
+      required: true,
+    },
     totalProfit: {
       type: Number,
       default: 0,
-    }, // Cumulative monthly profits earned so far
+    },
     date: {
       type: Date,
       default: Date.now,
@@ -27,15 +33,15 @@ const investmentSchema = new mongoose.Schema(
     },
     legalDocs: {
       type: String,
-    }, // Stores the file path of the uploaded legal document
+    },
     recordedBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       required: true,
-    }, // Admin/Super-Admin ID who initiated the project
+    },
     remarks: {
       type: String,
-    }, // Detailed investment/legal descriptions
+    },
   },
   {
     timestamps: true,
@@ -44,10 +50,6 @@ const investmentSchema = new mongoose.Schema(
   }
 );
 
-/**
- * Virtual for Return on Investment (ROI) percentage
- * Automatically calculates the project's performance for the UI
- */
 investmentSchema.virtual("roi").get(function () {
   if (!this.amount || this.amount === 0) return 0;
   return ((this.totalProfit / this.amount) * 100).toFixed(2);

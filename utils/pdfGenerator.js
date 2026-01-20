@@ -7,14 +7,12 @@ exports.generateMemberStatement = (res, member, transactions) => {
   res.setHeader("Content-Type", "application/pdf");
   res.setHeader(
     "Content-Disposition",
-    `attachment; filename=statement-${member.name}.pdf`
+    `attachment; filename=statement-${member.name}.pdf`,
   );
   doc.pipe(res);
 
   // Header - Society Branding
-  doc
-    .fontSize(20)
-    .text("Malibag Teachers’ Financial Society", { align: "center" });
+  doc.fontSize(20).text("Malibagh Somiti", { align: "center" });
   doc.fontSize(10).text("Monthly Transaction Statement", { align: "center" });
   doc.moveDown();
 
@@ -36,7 +34,7 @@ exports.generateMemberStatement = (res, member, transactions) => {
       .text(
         `${new Date(t.date).toLocaleDateString()}      ${t.type}      ${
           t.amount
-        }`
+        }`,
       );
   });
 

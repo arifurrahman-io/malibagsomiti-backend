@@ -1,23 +1,25 @@
 const User = require("../models/User");
 const Transaction = require("../models/Transaction");
 const mongoose = require("mongoose");
+const { sendWelcomeEmail } = require("../utils/email"); // ✅ Added Email Utility
 
 /**
  * ✅ CREATE MEMBER: Atomic Registry Entry
- * Calibrates monthly subscription automatically based on share count [cite: 2025-10-11].
+ * Calibrates monthly subscription automatically and sends credentials via email.
  */
 exports.createMember = async (req, res) => {
   try {
     const {
       name,
       email,
-      password,
+      password, // Plain text password from Admin input
       phone,
       nid,
       bankAccount,
       branch,
       shares,
       joiningDate,
+      accountNumber,
     } = req.body;
 
     // 1. Uniqueness Check (NID/Email)
@@ -31,15 +33,17 @@ exports.createMember = async (req, res) => {
 
     // 2. Financial Calibration
     const shareCount = parseInt(shares) || 1;
-    const monthlySubscription = shareCount * 1000; // Standard society rule
+    const monthlySubscription = shareCount * 1000;
 
+    // 3. Create Member in Database
     const member = await User.create({
       name,
       email,
-      password,
+      password, // Will be hashed by User model middleware
       phone,
       nid,
       bankAccount,
+      accountNumber,
       branch,
       shares: shareCount,
       joiningDate: joiningDate || Date.now(),
@@ -47,9 +51,23 @@ exports.createMember = async (req, res) => {
       role: "member",
     });
 
+    // 4. ✅ SEND WELCOME EMAIL WITH CREDENTIALS
+    // We send the plain text 'password' before it's hashed so the member knows it.
+    if (member) {
+      try {
+        await sendWelcomeEmail(member.email, member.name, password);
+      } catch (mailError) {
+        console.error(
+          "Member created but Welcome Email failed:",
+          mailError.message
+        );
+        // We do not block the response even if the email fails
+      }
+    }
+
     res.status(201).json({
       success: true,
-      message: `${member.name} successfully registered.`,
+      message: `${member.name} successfully registered and notified via email.`,
       data: {
         id: member._id.toString(),
         name: member.name,
@@ -68,7 +86,7 @@ exports.createMember = async (req, res) => {
 
 /**
  * ✅ GET ALL MEMBERS: High-Performance List
- * Optimized with server-side filtering for Branch performance sliders [cite: 2025-10-11].
+ * Optimized with server-side filtering for Branch performance sliders.
  */
 exports.getAllMembers = async (req, res) => {
   try {
@@ -78,7 +96,6 @@ exports.getAllMembers = async (req, res) => {
     if (branch) matchFilter.branch = branch;
     if (status) matchFilter.status = status;
 
-    // Search by Name or Phone for the Admin Search Bar
     if (search) {
       matchFilter.$or = [
         { name: { $regex: search, $options: "i" } },
@@ -134,7 +151,7 @@ exports.getAllMembers = async (req, res) => {
 
 /**
  * ✅ GET MEMBER PROFILE: Personal Financial Summary
- * Optimized for Mobile Dashboards (Bento Grid support) [cite: 2025-10-11].
+ * Optimized for Mobile Dashboards (Bento Grid support).
  */
 exports.getMemberProfile = async (req, res) => {
   try {
@@ -148,13 +165,11 @@ exports.getMemberProfile = async (req, res) => {
         .json({ success: false, message: "Member not found." });
     }
 
-    // 1. Aggregate Deposit History
     const stats = await Transaction.aggregate([
       { $match: { user: userObjectId, type: "deposit" } },
       { $group: { _id: null, total: { $sum: "$amount" } } },
     ]);
 
-    // 2. Fetch last 5 activities for the "Recent Activity" component [cite: 2025-10-11]
     const recentTransactions = await Transaction.find({ user: userObjectId })
       .sort({ date: -1 })
       .limit(5)
@@ -185,7 +200,7 @@ exports.getMemberProfile = async (req, res) => {
 
 /**
  * ✅ UPDATE MEMBER: Governance & Security
- * Syncs monthly subscriptions if shares are modified [cite: 2025-10-11].
+ * Syncs monthly subscriptions if shares are modified.
  */
 exports.updateMember = async (req, res) => {
   try {

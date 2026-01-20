@@ -10,7 +10,7 @@ const transactionSchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: ["deposit", "expense", "transfer", "investment"],
+      enum: ["deposit", "expense", "transfer", "investment", "adjustment"],
       required: true,
     },
     category: {
@@ -60,14 +60,14 @@ const transactionSchema = new mongoose.Schema(
     },
     remarks: { type: String },
   },
-  { timestamps: true }
+  { timestamps: true },
 );
 
 // 🔥 INDEX UPDATE: Removed unique constraints to allow flexible entries
 // We keep the index for reporting performance but ensure unique is false
 transactionSchema.index(
   { user: 1, date: 1, category: 1, bankAccount: 1, type: 1 },
-  { unique: false }
+  { unique: false },
 );
 
 module.exports = mongoose.model("Transaction", transactionSchema);

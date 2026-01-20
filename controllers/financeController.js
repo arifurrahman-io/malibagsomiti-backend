@@ -1,11 +1,20 @@
 const Transaction = require("../models/Transaction");
 const User = require("../models/User");
 const Investment = require("../models/Investment");
-const { sendDepositEmail } = require("../utils/sendEmail");
+const { sendDepositEmail } = require("../utils/email");
 const fs = require("fs");
 const path = require("path");
 const mongoose = require("mongoose");
 const BankAccount = require("../models/BankAccount");
+const FineSetting = require("../models/FineSetting");
+const admin = require("../config/firebase");
+const { sendPushNotification } = require("../utils/notification");
+
+const dir = "./uploads/documents/";
+
+if (!fs.existsSync(dir)) {
+  fs.mkdirSync(dir, { recursive: true });
+}
 
 /**
  * @section 1. Deposits & Collections
@@ -24,7 +33,7 @@ exports.processDeposit = async (req, res) => {
   try {
     const { userIds, remarks, month, year } = req.body;
 
-    // 1. Identify Treasury Source (Mother Account)
+    // ১. মাদার অ্যাকাউন্ট খুঁজে বের করা (ট্রেজারি সোর্স)
     const motherAccount = await BankAccount.findOne({
       isMotherAccount: true,
     }).session(session);
@@ -32,31 +41,33 @@ exports.processDeposit = async (req, res) => {
     if (!motherAccount)
       throw new Error("No Mother Account designated in registry.");
 
+    // ২. মাস এবং বছর নির্ধারণ (ডিফল্ট বর্তমান সময়)
     const targetMonth =
       month || new Date().toLocaleString("default", { month: "long" });
     const targetYear = year || new Date().getFullYear();
     let totalBatchAmount = 0;
 
-    // 2. Process Batch with Atomic Updates
-    const depositResults = await Promise.all(
+    const depositDataList = [];
+
+    // ৩. ব্যাচ প্রসেসিং এবং মেম্বার ডেটা আপডেট
+    await Promise.all(
       userIds.map(async (id) => {
         const user = await User.findById(id).session(session);
-        if (!user) return null;
+        if (!user) return;
 
-        // Calculate amount based on shares (Standard ৳1000 per share)
+        // শেয়ার অনুযায়ী টাকার পরিমাণ নির্ধারণ (৳১০০০ প্রতি শেয়ার)
         const amount = (user.shares || 1) * 1000;
         totalBatchAmount += amount;
 
-        // ✅ UPDATE USER RECORD: Physically increment the contribution field
-        // This ensures the "Total Contribution" is never 0 in your UI [cite: 2026-01-10]
-        await User.findByIdAndUpdate(
+        // ইউজারের মোট জমার পরিমাণ আপডেট করা
+        const updatedUser = await User.findByIdAndUpdate(
           id,
           { $inc: { totalDeposited: amount } },
-          { session, new: true }
+          { session, new: true },
         );
 
-        // ✅ CREATE TRANSACTION RECORD: Detailed audit trail
-        return await Transaction.create(
+        // লেজার বা ট্রানজেকশন রেকর্ড তৈরি করা
+        await Transaction.create(
           [
             {
               user: id,
@@ -74,17 +85,52 @@ exports.processDeposit = async (req, res) => {
                 `Monthly Share Collection: ${targetMonth} ${targetYear}`,
             },
           ],
-          { session }
+          { session },
         );
-      })
+
+        // ✅ ইমেইলের জন্য প্রয়োজনীয় ডেটা পুশ করা (undefined ফিক্স করার জন্য month ও year সহ)
+        depositDataList.push({
+          email: user.email,
+          name: user.name,
+          amount: amount,
+          totalBalance: updatedUser.totalDeposited,
+          date: new Date().toLocaleDateString("en-GB"),
+          month: targetMonth, // সাবজেক্টের জন্য পাঠানো হচ্ছে
+          year: targetYear, // সাবজেক্টের জন্য পাঠানো হচ্ছে
+        });
+
+        if (user.fcmToken) {
+          sendPushNotification([user.fcmToken], {
+            title: "Deposit Confirmed 💰",
+            body: `৳${amount.toLocaleString()} has been added to your savings for ${targetMonth}.`,
+            data: { screen: "Dashboard" },
+          });
+        }
+      }),
     );
 
-    // 3. UPDATE TREASURY BALANCE: Sync with Mother Account
+    // ৪. ব্যাংকের ব্যালেন্স আপডেট করা
     motherAccount.currentBalance += totalBatchAmount;
     await motherAccount.save({ session });
 
-    // 4. COMMIT & FINALIZE
+    // ৫. ডেটাবেস ট্রানজেকশন কমিট করা
     await session.commitTransaction();
+    session.endSession();
+
+    // ৬. ✅ সাকসেসফুলি সেভ হওয়ার পর মেম্বারদের ইমেইল নোটিফিকেশন পাঠানো
+    // Promise.allSettled ব্যবহার করা হয়েছে যাতে একজনের ইমেইল ফেইল হলেও বাকিদেরটা যায়।
+    Promise.allSettled(
+      depositDataList.map((data) =>
+        sendDepositEmail(data.email, {
+          name: data.name,
+          amount: data.amount,
+          date: data.date,
+          totalBalance: data.totalBalance,
+          month: data.month, // সাবজেক্ট এবং টেমপ্লেটের জন্য
+          year: data.year, // সাবজেক্ট এবং টেমপ্লেটের জন্য
+        }),
+      ),
+    ).catch((err) => console.error("Batch Email Error:", err));
 
     res.status(201).json({
       success: true,
@@ -93,12 +139,11 @@ exports.processDeposit = async (req, res) => {
       totalProcessed: totalBatchAmount,
     });
   } catch (error) {
-    // Rollback all changes if any single update fails (Database Integrity)
+    // কোনো এরর হলে সব পরিবর্তন রোলব্যাক করা হবে
     await session.abortTransaction();
+    session.endSession();
     console.error("Batch Deposit Failure:", error.message);
     res.status(500).json({ success: false, error: error.message });
-  } finally {
-    session.endSession();
   }
 };
 
@@ -229,46 +274,75 @@ exports.addExpense = async (req, res) => {
   }
 };
 
-// @desc    Comprehensive Global Dashboard Summary for Admins
+/**
+ * @desc    Comprehensive Global Dashboard Summary for Admins
+ * @route   GET /api/finance/summary
+ * @access  Private (Admin/Super-Admin)
+ */
 exports.getAdminSummary = async (req, res) => {
   try {
-    // 1. Fetch Society Liquidity (Total of all Bank Accounts)
-    // Using lean() for faster read performance on the dashboard
-    const accounts = await BankAccount.find().lean();
+    // 1. Fetch Global Fine Settings from Database
+    const settings = (await FineSetting.findOne().lean()) || {
+      gracePeriodMonths: 1,
+      finePercentage: 5,
+    };
+
+    // 2. Parallel Data Fetching for High-Performance Performance
+    const [accounts, investmentStats, members, shareStats, fineReductions] =
+      await Promise.all([
+        BankAccount.find().lean(), // Fetches all registry accounts
+        Investment.aggregate([
+          { $match: { status: "active" } },
+          {
+            $group: {
+              _id: null,
+              totalCapital: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+        ]),
+        User.find({ role: "member", status: "active" }).select(
+          "name phone joiningDate shares monthlySubscription branch totalDeposited",
+        ),
+        User.aggregate([
+          { $match: { status: "active", role: "member" } },
+          { $group: { _id: null, totalShares: { $sum: "$shares" } } },
+        ]),
+        /**
+         * 🔥 CORE UPDATE: Aggregate all fine reductions (Waivers + Payments)
+         * We subtract these categories from the calculated penalty to get the real 'Due' balance.
+         */
+        Transaction.aggregate([
+          { $match: { category: { $in: ["fine_waiver", "fine_payment"] } } },
+          { $group: { _id: "$user", totalReduced: { $sum: "$amount" } } },
+        ]),
+      ]);
+
+    // 3. Calculation of Society Liquidity (Total Net Worth)
     const totalLiquidity = accounts.reduce(
       (sum, acc) => sum + (acc.currentBalance || 0),
-      0
+      0,
     );
 
-    // 2. Investment Portfolio Stats
-    const investmentStats = await Investment.aggregate([
-      { $match: { status: "active" } },
-      {
-        $group: {
-          _id: null,
-          totalCapital: { $sum: "$amount" },
-          count: { $sum: 1 },
-        },
-      },
-    ]);
+    // 4. 🔥 CORE LOGIC: Aggregate Total Fine Due Society-Wide
+    let societyTotalFine = 0;
 
-    // 3. Member & Share Metrics
-    const totalMembers = await User.countDocuments({
-      role: "member",
-      status: "active",
+    members.forEach((member) => {
+      // Find total of already paid or waived amounts for this specific member
+      const memberReduction = fineReductions.find(
+        (r) => r._id?.toString() === member._id?.toString(),
+      );
+      const totalReduced = memberReduction ? memberReduction.totalReduced : 0;
+
+      /**
+       * 🚀 SYNCED CALCULATION:
+       * Uses the centralized helper to ensure 100% consistency across the platform.
+       */
+      const calc = calculateFineLogic(member, settings, totalReduced);
+      societyTotalFine += calc.fine;
     });
 
-    const shareStats = await User.aggregate([
-      { $match: { status: "active", role: "member" } },
-      { $group: { _id: null, totalShares: { $sum: "$shares" } } },
-    ]);
-    const totalSharesCount = shareStats[0]?.totalShares || 0;
-
-    /**
-     * 🚀 4. BRANCH PERFORMANCE AGGREGATION (Atomic & Real-time)
-     * Instead of relying on User.totalDeposited, we calculate from the Transaction ledger.
-     * This ensures the Progress Bar is 100% accurate [cite: 2025-10-11].
-     */
+    // 5. Branch Performance Aggregation (Regional Analytics)
     const branchStats = await User.aggregate([
       { $match: { role: "member", status: "active" } },
       {
@@ -276,17 +350,17 @@ exports.getAdminSummary = async (req, res) => {
           from: "transactions",
           localField: "_id",
           foreignField: "user",
-          as: "memberTransactions",
+          as: "txs",
         },
       },
       {
         $project: {
-          branch: 1,
+          branch: { $ifNull: ["$branch", "General"] },
           deposits: {
             $filter: {
-              input: "$memberTransactions",
-              as: "tx",
-              cond: { $eq: ["$$tx.type", "deposit"] },
+              input: { $ifNull: ["$txs", []] },
+              as: "t",
+              cond: { $eq: ["$$t.type", "deposit"] },
             },
           },
         },
@@ -294,14 +368,24 @@ exports.getAdminSummary = async (req, res) => {
       {
         $group: {
           _id: "$branch",
-          collection: { $sum: { $sum: "$deposits.amount" } },
+          collection: {
+            $sum: {
+              $reduce: {
+                input: "$deposits",
+                initialValue: 0,
+                in: { $add: ["$$value", { $ifNull: ["$$this.amount", 0] }] },
+              },
+            },
+          },
+          memberCount: { $sum: 1 },
         },
       },
       {
         $project: {
-          name: { $ifNull: ["$_id", "General"] },
+          name: "$_id",
           collection: 1,
-          // Calculate progress against a target (e.g., ৳500,000)
+          memberCount: 1,
+          // Progress vs regional target of ৳500,000
           progress: {
             $min: [
               {
@@ -318,42 +402,84 @@ exports.getAdminSummary = async (req, res) => {
       { $sort: { collection: -1 } },
     ]);
 
-    // 5. Global Recent Activity Log
+    // 6. Generate Chart Data (Income vs Expenditure)
+    const today = new Date();
+    const currentYear = today.getFullYear();
+    const monthlyStats = await Transaction.aggregate([
+      {
+        $match: {
+          $or: [{ year: currentYear }, { year: currentYear.toString() }],
+        },
+      },
+      {
+        $group: {
+          _id: { month: "$month", type: "$type" },
+          total: { $sum: "$amount" },
+        },
+      },
+    ]);
+
+    const monthNames = [
+      "January",
+      "February",
+      "March",
+      "April",
+      "May",
+      "June",
+      "July",
+      "August",
+      "September",
+      "October",
+      "November",
+      "December",
+    ];
+
+    const chartData = monthNames.map((m) => {
+      const income =
+        monthlyStats.find((s) => s._id.month === m && s._id.type === "deposit")
+          ?.total || 0;
+      const expense =
+        monthlyStats.find((s) => s._id.month === m && s._id.type === "expense")
+          ?.total || 0;
+      return {
+        label: m.substring(0, 3),
+        income,
+        expense,
+      };
+    });
+
+    // 7. Recent Transactions Feed
     const recentTransactions = await Transaction.find()
       .sort({ date: -1 })
-      .limit(8)
+      .limit(10) // Enhanced limit for deeper logs view
       .populate("user", "name")
       .lean();
 
-    // 6. Calculate Monthly Growth Trend [cite: 2025-10-11]
-    const currentMonth = new Date().toLocaleString("default", {
-      month: "long",
-    });
-    const currentYear = new Date().getFullYear();
+    const currentMonthLabel = monthNames[today.getMonth()].substring(0, 3);
+    const monthlyGrowth =
+      chartData.find((d) => d.label === currentMonthLabel)?.income || 0;
 
-    const monthlyGrowth = await Transaction.aggregate([
-      {
-        $match: {
-          type: "deposit",
-          month: currentMonth,
-          year: currentYear,
-        },
-      },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
-
-    // 7. ✅ STRUCTURED RESPONSE
+    // 8. Final Response Mapped to React Native UI structure
     res.status(200).json({
       success: true,
       data: {
-        totalNetWorth: totalLiquidity, // Hero Amount
-        totalMembers, // Registry Card Value
-        totalShares: totalSharesCount, // Registry Card Subtext
-        activeProjects: investmentStats[0]?.count || 0, // Portfolio Card Value
+        totalNetWorth: totalLiquidity,
+        totalMembers: members.length,
+        totalShares: shareStats[0]?.totalShares || 0,
+        activeProjects: investmentStats[0]?.count || 0,
         totalInvestments: investmentStats[0]?.totalCapital || 0,
-        recentTransactions, // Activity Log
-        branchStats: branchStats.length > 0 ? branchStats : [], // Branch Slider
-        monthlyGrowth: monthlyGrowth[0]?.total || 0, // Trend Text
+        totalFineDue: societyTotalFine, // Aggregated remaining fine balance
+        recentTransactions,
+        branchStats: branchStats.length > 0 ? branchStats : [],
+        topDepositors: members.map((member) => ({
+          _id: member._id,
+          name: member.name,
+          phone: member.phone,
+          branch: member.branch || "General",
+          totalDeposited: member.totalDeposited || 0,
+        })), // Passed for the Branch Registry FlatList
+        monthlyGrowth,
+        chartData,
       },
     });
   } catch (error) {
@@ -363,6 +489,68 @@ exports.getAdminSummary = async (req, res) => {
       message: "Governance data failed to synchronize.",
       error: error.message,
     });
+  }
+};
+
+/**
+ * @desc    Get Smooth Area Chart Data (Monthly Income vs Expense)
+ * @route   GET /api/finance/analytics/monthly-comparison
+ */
+exports.getMonthlyComparisonTrend = async (req, res) => {
+  try {
+    const currentYear = new Date().getFullYear();
+
+    const stats = await Transaction.aggregate([
+      {
+        $match: {
+          year: currentYear.toString(), // আপনার মডেলে বছর স্ট্রিং হিসেবে থাকলে
+        },
+      },
+      {
+        $group: {
+          _id: { month: "$month", type: "$type" },
+          totalAmount: { $sum: "$amount" },
+        },
+      },
+    ]);
+
+    const months = [
+      "January",
+      "February",
+      "March",
+      "April",
+      "May",
+      "June",
+      "July",
+      "August",
+      "September",
+      "October",
+      "November",
+      "December",
+    ];
+
+    // ডাটা ফরম্যাটিং (React Native এর জন্য)
+    const chartData = months.map((m) => {
+      const deposit = stats.find(
+        (s) => s._id.month === m && s._id.type === "deposit",
+      );
+      const expense = stats.find(
+        (s) => s._id.month === m && s._id.type === "expense",
+      );
+
+      return {
+        label: m.substring(0, 3),
+        income: deposit ? deposit.totalAmount : 0,
+        expense: expense ? expense.totalAmount : 0,
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      data: chartData,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
   }
 };
 
@@ -452,7 +640,7 @@ exports.getSocietySummary = async (req, res) => {
     const accounts = await BankAccount.find();
     const totalBankBalance = accounts.reduce(
       (sum, acc) => sum + (acc.currentBalance || 0),
-      0
+      0,
     );
 
     // 2. Aggregate Transaction History for Audit Stats
@@ -550,7 +738,7 @@ exports.getBranchSummary = async (req, res) => {
     const expenses = summary.find((s) => s._id === "expense")?.totalAmount || 0;
     const txCount = summary.reduce(
       (acc, curr) => acc + curr.transactionCount,
-      0
+      0,
     );
 
     // 4. Fetch additional branch metadata (Total active members in this branch) [cite: 2025-10-11]
@@ -639,87 +827,134 @@ exports.getAllInvestments = async (req, res) => {
 };
 
 /**
- * ✅ ADD INVESTMENT: Atomic transaction for society projects
- * Synchronizes Bank Balance, Project Registry, and Global Ledger [cite: 2025-10-11].
+ * ✅ ADD INVESTMENT: নতুন প্রজেক্ট বা ইনভেস্টমেন্ট শুরু করা
+ * এটি অটোমেটিকভাবে ব্যাংক ব্যালেন্স আপডেট করে, লেজার এন্ট্রি তৈরি করে এবং মেম্বারদের নোটিফিকেশন পাঠায়।
  */
 exports.addInvestment = async (req, res) => {
   const session = await mongoose.startSession();
   session.startTransaction();
-  try {
-    const { projectName, amount, bankAccount, startDate, category } = req.body;
 
-    // 1. Verify Funding Source
-    const fundingBank = await BankAccount.findById(bankAccount).session(
-      session
-    );
+  try {
+    const { projectName, amount, bankAccount, startDate, remarks } = req.body;
+
+    // ১. ফান্ডিং সোর্স যাচাই (ট্রেজারি চেক)
+    const fundingBank =
+      await BankAccount.findById(bankAccount).session(session);
 
     if (!fundingBank) {
-      throw new Error("Target bank account not found.");
+      throw new Error("Target bank account not found in registry.");
     }
+
     if (fundingBank.currentBalance < Number(amount)) {
       throw new Error(
-        `Insufficient funds. Current balance: ৳${fundingBank.currentBalance}`
+        `Insufficient funds in ${
+          fundingBank.bankName
+        }. Available: ৳${fundingBank.currentBalance.toLocaleString()}`,
       );
     }
 
-    // 2. Standardize Dates for App Registry [cite: 2025-10-11]
+    // ২. ফাইল আপলোড লজিক (cPanel স্টোরেজ পাথ)
+    let legalDocsPath = "";
+    if (req.file) {
+      legalDocsPath = `/uploads/documents/${req.file.filename}`;
+    }
+
+    // ৩. ডেটা ফরম্যাটিং (Registry এবং ফিল্টারিংয়ের জন্য)
     const dateObj = startDate ? new Date(startDate) : new Date();
     const month = dateObj.toLocaleString("default", { month: "long" });
     const year = dateObj.getFullYear();
 
-    // 3. Create Project Record
+    // ৪. ইনভেস্টমেন্ট রেকর্ড তৈরি (Project Record)
     const investment = await Investment.create(
       [
         {
-          ...req.body,
+          projectName,
+          amount: Number(amount),
+          bankAccount,
+          remarks,
+          legalDocs: legalDocsPath,
           status: "active",
           recordedBy: req.user.id,
+          date: dateObj,
         },
       ],
-      { session }
+      { session },
     );
 
-    // 4. Update Society Bank Balance (Real-time Liquidity) [cite: 2025-10-11]
+    // ৫. ব্যাংকের ব্যালেন্স আপডেট (Real-time Liquidity)
     fundingBank.currentBalance -= Number(amount);
     await fundingBank.save({ session });
 
-    // 5. Create Ledger Entry (for History & Trend Charts)
+    // ৬. লেজার বা ট্রানজেকশন এন্ট্রি (Audit Trail এর জন্য)
     await Transaction.create(
       [
         {
-          type: "expense",
-          category: "investment_capital",
+          user: req.user.id,
+          type: "investment",
+          category: "Investment",
+          subcategory: projectName,
           amount: Number(amount),
           bankAccount: fundingBank._id,
           recordedBy: req.user.id,
           date: dateObj,
-          month, // Used for App History Filtering
-          year, // Used for App Trend Aggregation
-          remarks: `Investment Capital: ${projectName}`,
-          // Link transaction to project for better auditing
-          referenceId: investment[0]._id,
+          month,
+          year,
+          remarks: `Capital Allocation: ${projectName}`,
+          referenceId: investment[0]._id, // প্রোজেক্টের সাথে ট্রানজেকশন লিঙ্ক করা
         },
       ],
-      { session }
+      { session },
     );
 
+    // ৭. সব অপারেশন সফল হলে ট্রানজেকশন কমিট করুন (নোটিফিকেশন পাঠানোর আগেই এটি শেষ করা জরুরি)
     await session.commitTransaction();
+    session.endSession();
 
-    // 6. ✅ STRUCTURED RESPONSE: Wrapped in 'data' for React Native UI sync [cite: 2025-10-11]
+    // ৮. মেম্বারদের পুশ নোটিফিকেশন পাঠানো (সাকসেসফুল সেভ হওয়ার পর)
+    // শুধুমাত্র যাদের FCM Token আছে এবং যারা একটিভ মেম্বার তাদের ফিল্টার করা হয়েছে
+    const allMembers = await User.find({
+      role: "member",
+      status: "active",
+      fcmToken: { $ne: null },
+    }).select("fcmToken");
+
+    const memberTokens = allMembers.map((m) => m.fcmToken).filter((t) => t);
+
+    if (memberTokens.length > 0) {
+      // utils/notification.js এর মাধ্যমে নোটিফিকেশন পাঠানো হচ্ছে
+      await sendPushNotification(memberTokens, {
+        title: "New Project Initiated! 🚀",
+        body: `We just started "${projectName}" with a capital of ৳${Number(amount).toLocaleString()}.`,
+        data: {
+          screen: "Investments",
+          id: investment[0]._id.toString(),
+        },
+      });
+      console.log(
+        `Successfully sent project notification to ${memberTokens.length} members.`,
+      );
+    }
+
+    // ৯. সাকসেস রেসপন্স পাঠানো
     res.status(201).json({
       success: true,
-      message: "Investment project initiated successfully",
+      message: `${projectName} initiated successfully with ৳${Number(
+        amount,
+      ).toLocaleString()}`,
       data: investment[0],
     });
   } catch (error) {
-    await session.abortTransaction();
+    // কোনো এরর হলে সব পরিবর্তন রোলব্যাক করা হবে
+    if (session.inTransaction()) {
+      await session.abortTransaction();
+    }
     console.error("Investment Failure:", error.message);
     res.status(400).json({
       success: false,
-      message: error.message || "Failed to process investment",
+      message: error.message || "Failed to initiate investment project",
     });
   } finally {
-    session.endSession();
+    if (session) session.endSession();
   }
 };
 
@@ -767,7 +1002,7 @@ exports.updateInvestment = async (req, res) => {
     const updated = await Investment.findByIdAndUpdate(
       req.params.id,
       { $set: updateFields },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     ).lean();
 
     /**
@@ -801,60 +1036,79 @@ exports.updateInvestment = async (req, res) => {
  * Removes project registry, cleans up legal files, and handles audit trail [cite: 2025-10-11].
  */
 exports.deleteInvestment = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+
   try {
-    const investment = await Investment.findById(req.params.id);
+    const { closingValue, bankAccount } = req.body; // Sent from the Mobile Modal
+    const investment = await Investment.findById(req.params.id).session(
+      session,
+    );
 
     if (!investment) {
-      return res.status(404).json({
-        success: false,
-        message: "Project record not found in society registry.",
-      });
+      return res
+        .status(404)
+        .json({ success: false, message: "Project not found." });
     }
 
-    // 1. Storage Cleanup: Remove legal documents from server
+    // 1. DYNAMIC TREASURY SYNC: Add closing value back to the Mother Account
+    const targetBank = await BankAccount.findById(
+      bankAccount || investment.bankAccount,
+    ).session(session);
+    if (targetBank && closingValue) {
+      targetBank.currentBalance += Number(closingValue);
+      await targetBank.save({ session });
+
+      // 2. CREATE AUDIT TRAIL: Record the final liquidation in the Ledger
+      await Transaction.create(
+        [
+          {
+            user: req.user.id,
+            type: "deposit",
+            category: "Investment",
+            subcategory: investment.projectName,
+            amount: Number(closingValue),
+            month: new Date().toLocaleString("default", { month: "long" }),
+            year: new Date().getFullYear(),
+            date: new Date(),
+            bankAccount: targetBank._id,
+            remarks: `Project Liquidation: ${investment.projectName} closed.`,
+            recordedBy: req.user.id,
+          },
+        ],
+        { session },
+      );
+    }
+
+    // 3. STORAGE CLEANUP: Remove legal documents from server
     if (investment.legalDocs) {
       const filePath = path.join(__dirname, "../../", investment.legalDocs);
       if (fs.existsSync(filePath)) {
         try {
           fs.unlinkSync(filePath);
         } catch (err) {
-          console.error(
-            "File deletion failed during project removal:",
-            err.message
-          );
-          // We continue deletion even if file removal fails to avoid stuck records
+          console.error("File removal error:", err.message);
         }
       }
     }
 
-    // 2. Optional: Check for active profits before deletion
-    if (investment.totalProfit > 0 && investment.status === "active") {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Cannot delete an active project with recorded profits. Please close the project first.",
-      });
-    }
+    // 4. FINALIZE: Remove the project document
+    await investment.deleteOne({ session });
 
-    // 3. Delete the Document
-    await investment.deleteOne();
+    await session.commitTransaction();
+    session.endSession();
 
-    /**
-     * 🚀 APP SYNC:
-     * Provide a clear success message that can be used in a Toast or Alert
-     * on the React Native side to confirm the deletion [cite: 2025-10-11].
-     */
     res.status(200).json({
       success: true,
-      message: "Project and associated documents removed successfully.",
-      deletedId: req.params.id, // Return ID to help frontend filter state
+      message: "Project liquidated and registry records removed successfully.",
     });
   } catch (error) {
-    console.error("Investment Deletion Error:", error.message);
+    await session.abortTransaction();
+    session.endSession();
+    console.error("Investment Liquidation Error:", error.message);
     res.status(500).json({
       success: false,
-      message: "Security protocols prevented project deletion.",
-      error: error.message,
+      message: "Governance protocol failed to close project.",
     });
   }
 };
@@ -869,7 +1123,7 @@ exports.recordInvestmentProfit = async (req, res) => {
   try {
     const { amount, remarks, month, year, type, bankAccountId } = req.body;
     const investment = await Investment.findById(req.params.id).session(
-      session
+      session,
     );
 
     if (!investment) {
@@ -882,7 +1136,7 @@ exports.recordInvestmentProfit = async (req, res) => {
     const bank = await BankAccount.findById(bankAccountId).session(session);
     if (!bank) {
       throw new Error(
-        "A valid bank account must be selected to record profit/expense."
+        "A valid bank account must be selected to record profit/expense.",
       );
     }
 
@@ -921,7 +1175,7 @@ exports.recordInvestmentProfit = async (req, res) => {
           referenceId: investment._id,
         },
       ],
-      { session }
+      { session },
     );
 
     await session.commitTransaction();
@@ -1018,7 +1272,7 @@ exports.downloadInvestmentReport = async (req, res) => {
     // 1. Fetch Project with expanded Auditor details
     const investment = await Investment.findById(req.params.id).populate(
       "recordedBy",
-      "name email"
+      "name email",
     );
 
     if (!investment) {
@@ -1065,7 +1319,7 @@ exports.downloadInvestmentReport = async (req, res) => {
       data: {
         reportMetadata: {
           generatedAt: new Date().toISOString(),
-          societyName: "Malibag Somiti", // Branding for header [cite: 2025-10-11]
+          societyName: "Malibagh Somiti", // Branding for header [cite: 2025-10-11]
           reportType: "Project Performance Statement",
         },
         project: {
@@ -1198,7 +1452,7 @@ exports.deleteTransaction = async (req, res) => {
   session.startTransaction();
   try {
     const transaction = await Transaction.findById(req.params.id).session(
-      session
+      session,
     );
 
     if (!transaction) {
@@ -1210,7 +1464,7 @@ exports.deleteTransaction = async (req, res) => {
     // 1. REVERSE BANK BALANCE [cite: 2025-10-11]
     if (transaction.bankAccount) {
       const bank = await BankAccount.findById(transaction.bankAccount).session(
-        session
+        session,
       );
       if (bank) {
         if (transaction.type === "deposit") {
@@ -1238,7 +1492,7 @@ exports.deleteTransaction = async (req, res) => {
       transaction.category.includes("investment")
     ) {
       const project = await Investment.findById(
-        transaction.referenceId
+        transaction.referenceId,
       ).session(session);
       if (project) {
         if (transaction.type === "deposit") {
@@ -1337,7 +1591,7 @@ exports.getCollectionTrend = async (req, res) => {
     const growth =
       lastMonthData > 0
         ? (((currentMonthData - lastMonthData) / lastMonthData) * 100).toFixed(
-            1
+            1,
           )
         : 0;
 
@@ -1363,63 +1617,118 @@ exports.getCollectionTrend = async (req, res) => {
  * @route   GET /api/finance/member-summary
  * @access  Private (Member/Admin)
  */
+/**
+ * @desc    Get member-specific dashboard stats (Synced with Modern UI)
+ * @route   GET /api/finance/member-summary
+ * @access  Private (Member/Admin)
+ */
 exports.getMemberSummary = async (req, res) => {
   try {
     const userId = req.user.id;
 
-    const globalStats = await Transaction.aggregate([
-      {
-        $group: {
-          _id: null,
-          totalIncome: {
-            $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] },
-          },
-          totalExpense: {
-            $sum: { $cond: [{ $eq: ["$type", "expense"] }, "$amount", 0] },
+    // 1. Fetch Dynamic Settings from database
+    const dbSettings = await FineSetting.findOne().lean();
+    const activeSettings = {
+      gracePeriodMonths: dbSettings?.gracePeriodMonths ?? 1,
+      finePercentage: dbSettings?.finePercentage ?? 5,
+    };
+
+    // 2. Parallel Data Fetching for Performance
+    const [
+      globalStats,
+      personalStats,
+      bankAccounts,
+      investments,
+      userDetails,
+      fineReductions,
+    ] = await Promise.all([
+      Transaction.aggregate([
+        {
+          $group: {
+            _id: null,
+            totalIncome: {
+              $sum: { $cond: [{ $eq: ["$type", "deposit"] }, "$amount", 0] },
+            },
+            totalExpense: {
+              $sum: { $cond: [{ $eq: ["$type", "expense"] }, "$amount", 0] },
+            },
           },
         },
-      },
+      ]),
+      Transaction.aggregate([
+        {
+          $match: {
+            user: new mongoose.Types.ObjectId(userId),
+            type: "deposit",
+            // 🔥 CRITICAL: Exclude fine payments from personal savings
+            category: { $ne: "fine_payment" },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]),
+      BankAccount.find({
+        $or: [{ isMotherAccount: true }, { currentBalance: { $gt: 0 } }],
+      }).lean(),
+      Investment.find({ status: "active" }).sort({ createdAt: -1 }).lean(),
+      User.findById(userId).select(
+        "shares phone joiningDate monthlySubscription",
+      ),
+      /**
+       * 🔥 Aggregate all fine reductions (Waivers + Paid Fines)
+       * Both reduce the remaining 'Total Fine Due' balance.
+       */
+      Transaction.aggregate([
+        {
+          $match: {
+            user: new mongoose.Types.ObjectId(userId),
+            category: { $in: ["fine_waiver", "fine_payment"] },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]),
     ]);
 
     const globalData = globalStats[0] || { totalIncome: 0, totalExpense: 0 };
+    const totalReduced = fineReductions[0]?.total || 0;
 
-    // 1. Personal Savings (Net Liquidity card)
-    const personalStats = await Transaction.aggregate([
-      {
-        $match: { user: new mongoose.Types.ObjectId(userId), type: "deposit" },
-      },
-      { $group: { _id: null, total: { $sum: "$amount" } } },
-    ]);
+    // 3. 🔥 DYNAMIC FINE CALCULATION
+    let totalFineDue = 0;
+    let overdueMonths = 0;
 
-    /**
-     * 2. Bank Accounts (Sliding Data)
-     * Changed from findOne to find() to support multiple accounts (Savings, Current, FDR)
-     *
-     */
-    const bankAccounts = await BankAccount.find({
-      $or: [{ isMotherAccount: true }, { currentBalance: { $gt: 0 } }],
-    }).lean();
+    if (userDetails && userDetails.joiningDate) {
+      const today = new Date();
+      const start = new Date(userDetails.joiningDate);
 
-    /**
-     * 3. Active Investments (Sliding Data)
-     * Changed from findOne to find() to support multiple active projects [cite: 2025-10-11]
-     */
-    const investments = await Investment.find({
-      status: "active",
-    })
-      .sort({ createdAt: -1 })
-      .lean();
+      let monthDiff = (today.getFullYear() - start.getFullYear()) * 12;
+      monthDiff += today.getMonth() - start.getMonth();
 
-    // 4. User Details for Shares & Member ID
-    const userDetails = await User.findById(userId).select("shares phone");
+      // Cumulative fine logic for EVERY overdue month
+      if (monthDiff > activeSettings.gracePeriodMonths) {
+        overdueMonths = monthDiff - activeSettings.gracePeriodMonths;
+        const shareCount = userDetails.shares || 1;
+        const monthlyInstallment =
+          shareCount * (userDetails.monthlySubscription || 1000);
 
+        const monthlyFine =
+          (monthlyInstallment * activeSettings.finePercentage) / 100;
+        const grossCalculatedFine = Math.round(overdueMonths * monthlyFine);
+
+        // 🔥 Subtract BOTH partial waivers and already paid fines from the gross penalty
+        totalFineDue = Math.max(0, grossCalculatedFine - totalReduced);
+      }
+    }
+
+    // 4. Response Data Mapped for React Native UI
     res.status(200).json({
       success: true,
       data: {
-        // Top Card Stats
+        // Top Card Summary: reflects savings WITHOUT fine payments
         netLiquidity: personalStats[0]?.total || 0,
         societyShares: userDetails?.shares || 0,
         memberId: userDetails?.phone || "N/A",
+        totalFineDue: totalFineDue, // Remaining balance after adjustments
+        overdueMonths: overdueMonths,
+        totalFineAdjustments: totalReduced, // Total of waivers + cash payments
 
         globalRegistry: {
           income: globalData.totalIncome,
@@ -1427,10 +1736,6 @@ exports.getMemberSummary = async (req, res) => {
           net: globalData.totalIncome - globalData.totalExpense,
         },
 
-        /**
-         * 5. Arrays for sliding components [cite: 2025-10-11]
-         * These keys must match your Dashboard.jsx FlatList data props
-         */
         bankAccounts: bankAccounts.map((acc) => ({
           _id: acc._id,
           bankName: acc.bankName,
@@ -1446,7 +1751,6 @@ exports.getMemberSummary = async (req, res) => {
           investmentType: inv.investmentType || "Project Capital",
         })),
 
-        // Personal Registry List
         recentTransactions: await Transaction.find({ user: userId })
           .sort({ date: -1 })
           .limit(5)
@@ -1454,6 +1758,7 @@ exports.getMemberSummary = async (req, res) => {
       },
     });
   } catch (error) {
+    console.error("Dashboard Sync Error:", error.message);
     res.status(500).json({
       success: false,
       message: "Dashboard data sync failed",
@@ -1463,38 +1768,46 @@ exports.getMemberSummary = async (req, res) => {
 };
 
 /**
- * ✅ GET MEMBER HISTORY: Personal Ledger & Portfolio Summary
- * Dual-purpose: Member views own history, Admin views member details [cite: 2025-10-11].
+ * ✅ GET MEMBER HISTORY: Full Audit Trail & Real-time Fine Calculation
+ * Dual-purpose: Admin views member dossier with penalties and registry history.
+ */
+/**
+ * ✅ GET MEMBER HISTORY: Full Audit Trail & Real-time Fine Calculation
+ * Dual-purpose: Admin views member dossier with penalties and registry history.
  */
 exports.getMemberHistory = async (req, res) => {
   try {
     const userId = req.params.id || req.user.id;
 
-    // 1. FETCH USER & CALCULATE AGGREGATE STATS IN PARALLEL [cite: 2026-01-10]
-    const [user, totalStats, historyData] = await Promise.all([
+    // 1. FETCH CONFIG & CORE DATA IN PARALLEL
+    const [user, settings, historyData, fineReductions] = await Promise.all([
       User.findById(userId)
         .select(
-          "name totalDeposited shares branch joiningDate status profilePicture"
+          "name totalDeposited shares branch joiningDate status profilePicture monthlySubscription",
         )
         .lean(),
-
-      // Dynamic Calculation: Sum all 'deposit' type transactions for this user
-      Transaction.aggregate([
-        {
-          $match: {
-            user: new mongoose.Types.ObjectId(userId),
-            type: "deposit",
-          },
-        },
-        { $group: { _id: null, total: { $sum: "$amount" } } },
-      ]),
-
-      // Fetch All Transactions
+      FineSetting.findOne().lean() || {
+        gracePeriodMonths: 1,
+        finePercentage: 5,
+      },
       Transaction.find({ user: userId })
         .sort({ date: -1 })
         .populate("recordedBy", "name")
         .populate("bankAccount", "bankName accountNumber")
         .lean(),
+      /**
+       * 🔥 Aggregate all fine reductions (Waivers + Paid Fines)
+       * We treat 'fine_payment' and 'fine_waiver' as deductions from the gross penalty.
+       */
+      Transaction.aggregate([
+        {
+          $match: {
+            user: new mongoose.Types.ObjectId(userId),
+            category: { $in: ["fine_waiver", "fine_payment"] },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ]),
     ]);
 
     if (!user) {
@@ -1503,11 +1816,16 @@ exports.getMemberHistory = async (req, res) => {
         .json({ success: false, message: "Member not found." });
     }
 
-    // Determine the true contribution sum [cite: 2026-01-10]
-    const realTotalContribution =
-      totalStats.length > 0 ? totalStats[0].total : user.totalDeposited || 0;
+    // 2. 🔥 DYNAMIC FINE CALCULATION USING HELPER
+    const totalReduced = fineReductions[0]?.total || 0;
 
-    // 2. DATA NORMALIZATION FOR MODERN UI [cite: 2025-10-11]
+    /**
+     * 🚀 SYNCED CALCULATION:
+     * Uses centralized logic to calculate cumulative fines and subtract adjustments.
+     */
+    const calc = calculateFineLogic(user, settings, totalReduced);
+
+    // 3. DATA NORMALIZATION FOR MODERN UI
     res.status(200).json({
       success: true,
       data: {
@@ -1517,30 +1835,27 @@ exports.getMemberHistory = async (req, res) => {
           avatar: user.profilePicture || null,
           branch: user.branch,
           shares: user.shares || 0,
-          totalContribution: realTotalContribution,
+          totalDeposited: user.totalDeposited || 0, // Savings remains untouched by fine payments
+          totalFineDue: calc.fine, // Net remaining balance
+          overdueMonths: calc.months,
+          totalFineAdjustments: totalReduced, // Combined Waivers + Payments
           joiningDate: user.joiningDate,
           accountStatus: user.status.toUpperCase(),
           lastActivity: historyData.length > 0 ? historyData[0].date : null,
         },
-        // Mapping history to ensure month/year are visible to all roles
+        // Mapping history for professional list view
         transactions: historyData.map((t) => ({
           id: t._id,
           category: t.category || "General Entry",
-          subcategory: t.subcategory || "Regular Registry",
-          remarks: t.remarks || "",
           amount: t.amount,
           type: t.type,
           isDeposit: t.type === "deposit",
-
-          // ✅ CRITICAL FIX: Explicitly passing month and year strings
           month: t.month,
           year: t.year,
-
           date: t.date,
           formattedDate: new Date(t.date).toLocaleDateString("en-GB", {
             day: "2-digit",
             month: "short",
-            year: "numeric",
           }),
           bank: t.bankAccount
             ? {
@@ -1553,10 +1868,12 @@ exports.getMemberHistory = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error("Member Ledger Error:", error.message);
-    res
-      .status(500)
-      .json({ success: false, message: "Server Error", error: error.message });
+    console.error("Member Ledger Logic Error:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Registry sync failed.",
+      error: error.message,
+    });
   }
 };
 
@@ -1588,5 +1905,285 @@ exports.getInvestmentById = async (req, res) => {
       message: "Server Error: Database sync failed.",
       error: error.message,
     });
+  }
+};
+
+/**
+ * ✅ HELPER: ক্যালকুলেশন লজিক (রিয়েল-টাইম সেটিংস সহ)
+ */
+/**
+ * ✅ CENTRALIZED FINE CALCULATOR
+ * Calculated for every overdue month after the grace period.
+ */
+/**
+ * ✅ CENTRALIZED FINE CALCULATOR
+ * Calculates cumulative fines for every month exceeding the grace period.
+ * Subtracts both administrative waivers and actual cash payments already made.
+ */
+const calculateFineLogic = (member, settings, totalReduced = 0) => {
+  const { gracePeriodMonths, finePercentage } = settings;
+  const today = new Date();
+  const joiningDate = new Date(member.joiningDate);
+
+  // 1. Calculate total months since joining
+  let totalMonthsSinceJoining =
+    (today.getFullYear() - joiningDate.getFullYear()) * 12;
+  totalMonthsSinceJoining += today.getMonth() - joiningDate.getMonth();
+
+  // 2. Fine applies only if total months strictly exceed the grace period
+  if (totalMonthsSinceJoining > gracePeriodMonths) {
+    const overdueMonths = totalMonthsSinceJoining - gracePeriodMonths;
+    const shareCount = member.shares || 1;
+
+    // Member-specific subscription or default to 1000
+    const monthlyInstallment =
+      shareCount * (member.monthlySubscription || 1000);
+
+    // Monthly Fine Rate = (Installment * Percentage / 100)
+    const monthlyFineAmount = (monthlyInstallment * finePercentage) / 100;
+
+    // Total Gross Fine = (Monthly Fine * Number of Overdue Months)
+    const grossFine = Math.round(overdueMonths * monthlyFineAmount);
+
+    /**
+     * 🚀 FINAL CALCULATION:
+     * We subtract 'totalReduced' which includes:
+     * - category: "fine_waiver" (Admin adjustments)
+     * - category: "fine_payment" (Cash already paid by member)
+     */
+    const remainingFine = Math.max(0, grossFine - totalReduced);
+
+    return {
+      fine: remainingFine, // The final amount the member still owes
+      months: overdueMonths,
+      dueAmount: monthlyInstallment * overdueMonths, // Principal amount overdue
+      totalReduced: totalReduced, // For transparency in UI
+    };
+  }
+
+  // No fine applicable if within grace period
+  return { fine: 0, months: 0, dueAmount: 0, totalReduced: 0 };
+};
+
+/**
+ * ✅ PARTIAL FINE WAIVER: Audit Trail Integration
+ * Records a waiver transaction that reduces the member's total penalty.
+ */
+exports.waiveFinePartial = async (req, res) => {
+  try {
+    const { userId, waiveAmount, remarks } = req.body;
+
+    if (!userId || !waiveAmount) {
+      return res.status(400).json({
+        success: false,
+        message: "User ID and Amount are required for partial waiver.",
+      });
+    }
+
+    // 🔥 Create an adjustment record
+    const waiverTransaction = await Transaction.create({
+      user: userId,
+      type: "adjustment", // Matches updated enum
+      category: "fine_waiver", // Matches calculation logic
+      amount: Number(waiveAmount),
+      date: new Date(),
+      recordedBy: req.user.id,
+      bankAccount: null, // Waiver does not affect bank balance
+      remarks: remarks || "", // Remarks now strictly optional
+    });
+
+    res.status(201).json({
+      success: true,
+      message: `Successfully waived ৳${waiveAmount.toLocaleString()}`,
+      data: waiverTransaction,
+    });
+  } catch (error) {
+    console.error("Partial Waiver Error:", error.message);
+    res
+      .status(500)
+      .json({ success: false, message: "Server error during waiver" });
+  }
+};
+
+/**
+ * ✅ COLLECT PAID FINE
+ * Adds money to the bank but NOT to member's personal savings (totalDeposited).
+ */
+exports.collectPaidFine = async (req, res) => {
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const { userId, amount, bankAccountId, remarks } = req.body;
+
+    const bank = await BankAccount.findById(bankAccountId).session(session);
+    if (!bank) throw new Error("Target bank account not found.");
+
+    // 1. Create Transaction
+    const finePaid = await Transaction.create(
+      [
+        {
+          user: userId,
+          type: "deposit",
+          category: "fine_payment", // Distinct from monthly_deposit
+          amount: Number(amount),
+          bankAccount: bankAccountId,
+          recordedBy: req.user.id,
+          date: new Date(),
+          remarks: remarks || "Penalty payment received.",
+        },
+      ],
+      { session },
+    );
+
+    // 2. Update Bank Balance
+    bank.currentBalance += Number(amount);
+    await bank.save({ session });
+
+    // 🔥 NOTE: We do NOT call User.findByIdAndUpdate with $inc: { totalDeposited: amount }
+    // This ensures the fine is not treated as member savings.
+
+    await session.commitTransaction();
+    res.status(200).json({
+      success: true,
+      message: "Fine collected and added to Treasury.",
+    });
+  } catch (error) {
+    await session.abortTransaction();
+    res.status(500).json({ success: false, error: error.message });
+  } finally {
+    session.endSession();
+  }
+};
+
+/**
+ * @desc    Get current fine settings [cite: 2025-10-11]
+ * @route   GET /api/finance/fine-settings
+ */
+exports.getFineSettings = async (req, res) => {
+  try {
+    let settings = await FineSetting.findOne();
+
+    // যদি ডিবিতে ডাটা না থাকে তবে ডিফল্ট ক্রিয়েট করবে
+    if (!settings) {
+      settings = await FineSetting.create({
+        gracePeriodMonths: 1,
+        finePercentage: 5,
+      });
+    }
+
+    res.status(200).json({ success: true, data: settings });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+};
+
+/**
+ * @desc    Update fine settings & Sync Engine
+ * @route   PUT /api/finance/fine-settings
+ */
+exports.updateFineSettings = async (req, res) => {
+  try {
+    const { gracePeriodMonths, finePercentage } = req.body;
+
+    if (gracePeriodMonths === undefined || finePercentage === undefined) {
+      return res
+        .status(400)
+        .json({ success: false, message: "Parameters required." });
+    }
+
+    // ডাটাবেসে আপডেট বা ক্রিয়েট (Upsert)
+    const settings = await FineSetting.findOneAndUpdate(
+      {},
+      {
+        gracePeriodMonths: Number(gracePeriodMonths),
+        finePercentage: Number(finePercentage),
+        lastUpdatedBy: req.user.id,
+      },
+      { new: true, upsert: true },
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Fine Engine Configured & Synchronized!",
+      data: settings,
+    });
+  } catch (error) {
+    res.status(500).json({ success: false, message: "Internal Server Error" });
+  }
+};
+
+/**
+ * @desc    Get Defaulter List with Dynamic Calculations
+ * @route   GET /api/finance/defaulters
+ * @access  Admin/Super-Admin
+ */
+exports.getDefaulterList = async (req, res) => {
+  try {
+    // 1. Fetch the latest fine engine settings
+    const settings = (await FineSetting.findOne()) || {
+      gracePeriodMonths: 1,
+      finePercentage: 5,
+    };
+
+    // 2. Fetch active members
+    const members = await User.find({
+      role: "member",
+      status: "active",
+    }).select("name phone joiningDate shares branch monthlySubscription");
+
+    /**
+     * 3. Fetch all fine reductions (Waivers and Paid Fines)
+     * We treat 'fine_payment' as a deduction from the total calculated penalty.
+     */
+    const fineReductions = await Transaction.aggregate([
+      {
+        $match: {
+          category: { $in: ["fine_waiver", "fine_payment"] },
+        },
+      },
+      {
+        $group: {
+          _id: "$user",
+          totalReduced: { $sum: "$amount" },
+        },
+      },
+    ]);
+
+    // 4. Map members to the defaulter list using cumulative logic
+    const defaulters = members
+      .map((member) => {
+        // Find the total reduction (waivers + payments) for this specific member
+        const reductionData = fineReductions.find(
+          (r) => r._id.toString() === member._id.toString(),
+        );
+        const totalReducedAmount = reductionData
+          ? reductionData.totalReduced
+          : 0;
+
+        // Calculate fine using the centralized cumulative month logic
+        const calc = calculateFineLogic(member, settings, totalReducedAmount);
+
+        // Only include in the list if there is still a remaining fine due
+        if (calc.fine > 0) {
+          return {
+            ...member._doc,
+            totalFineDue: calc.fine, // Remaining balance after waivers/payments
+            overdueMonths: calc.months, // Months exceeding grace period
+            dueAmount: calc.dueAmount, // Total principal installments overdue
+            totalReductions: totalReducedAmount, // Total of waivers and payments
+          };
+        }
+        return null;
+      })
+      .filter((m) => m !== null);
+
+    res.status(200).json({
+      success: true,
+      count: defaulters.length,
+      data: defaulters,
+    });
+  } catch (error) {
+    console.error("Defaulter Registry Error:", error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 };

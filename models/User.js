@@ -28,6 +28,17 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: [true, "Please add a phone number"],
     },
+
+    bankAccount: {
+      type: String,
+      trim: true,
+    },
+    // ✅ নতুন ফিল্ড ২
+    accountNumber: {
+      type: String,
+      trim: true,
+    },
+
     nid: {
       type: String,
       required: [true, "Please add an NID number"],
@@ -60,12 +71,12 @@ const userSchema = new mongoose.Schema(
       type: String,
       required: [true, "Please select a branch"],
       enum: [
-        "Malibag-A-Day",
-        "Malibag-A-Morning",
-        "Malibag-B-Day",
-        "Malibag-B-Morning",
-        "Malibag-C-Day",
-        "Malibag-C-Morning",
+        "Malibagh-A-Day",
+        "Malibagh-A-Morning",
+        "Malibagh-B-Day",
+        "Malibagh-B-Morning",
+        "Malibagh-C-Day",
+        "Malibagh-C-Morning",
       ],
       index: true,
     },
@@ -78,12 +89,16 @@ const userSchema = new mongoose.Schema(
       enum: ["active", "inactive"],
       default: "active",
     },
+    fcmToken: {
+      type: String,
+      default: null,
+    },
   },
   {
     timestamps: true,
     toJSON: { virtuals: true },
     toObject: { virtuals: true },
-  }
+  },
 );
 
 // --- VIRTUALS for Dynamic UI [cite: 2025-10-11] ---

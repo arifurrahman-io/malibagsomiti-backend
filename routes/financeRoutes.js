@@ -19,9 +19,19 @@ const {
   getAllTransactions,
   getMemberHistory,
   getMemberSummary,
+  updateFineSettings,
+  getFineSettings,
+  getDefaulterList,
 } = require("../controllers/financeController");
 
 const { protect, authorize } = require("../middleware/authMiddleware");
+const fs = require("fs");
+const dir = "./uploads/documents/";
+
+// Ensure upload directory exists
+if (!fs.existsSync(dir)) {
+  fs.mkdirSync(dir, { recursive: true });
+}
 
 /**
  * 1. Multer Storage Configuration
@@ -42,7 +52,7 @@ const upload = multer({
   fileFilter: (req, file, cb) => {
     const allowedTypes = /jpeg|jpg|png|pdf/;
     const isExtAllowed = allowedTypes.test(
-      path.extname(file.originalname).toLowerCase()
+      path.extname(file.originalname).toLowerCase(),
     );
     if (isExtAllowed) return cb(null, true);
     cb(new Error("Only .png, .jpg, .jpeg and .pdf files are allowed!"));
@@ -53,7 +63,7 @@ const upload = multer({
 router.use(protect);
 
 /**
- * @section Administrative Transactions
+ * @section 1. Administrative Transactions
  */
 router.post("/deposit", authorize("admin", "super-admin"), processDeposit);
 router.post("/expense", authorize("admin", "super-admin"), addExpense);
@@ -61,70 +71,82 @@ router.post(
   "/investment",
   authorize("admin", "super-admin"),
   upload.single("legalDocs"),
-  addInvestment
+  addInvestment,
 );
 
 /**
- * @section Project & Investment Management
+ * @section 2. Defaulter & Fine Management
+ * জরিমানার হার এবং গ্রেস পিরিয়ড নিয়ন্ত্রণের জন্য [cite: 2025-10-11]
+ */
+router
+  .route("/fine-settings")
+  .get(authorize("admin", "super-admin"), getFineSettings)
+  .put(authorize("super-admin"), updateFineSettings);
+
+router.get("/defaulters", authorize("admin", "super-admin"), getDefaulterList);
+
+/**
+ * @section 3. Project & Investment Management
  */
 router.get("/investments", getAllInvestments);
 router.get("/investment/:id", getInvestmentById);
 router.get(
   "/investment/:id/history",
   authorize("admin", "super-admin"),
-  getInvestmentHistory
+  getInvestmentHistory,
 );
 router.post(
   "/investment/:id/profit",
   authorize("admin", "super-admin"),
-  recordInvestmentProfit
+  recordInvestmentProfit,
 );
 router.get(
   "/investment/:id/report",
   authorize("admin", "super-admin"),
-  downloadInvestmentReport
+  downloadInvestmentReport,
 );
 
 /**
- * @section Analytics & Summaries
+ * @section 4. Analytics & Summaries
  */
 router.get("/summary", getAdminSummary);
 router.get(
   "/summary/:branch",
   authorize("admin", "super-admin"),
-  getBranchSummary
+  getBranchSummary,
 );
-router.get("/member-summary", getMemberSummary);
+router.get("/member-summary", getMemberSummary); // মেম্বার ড্যাশবোর্ডে জরিমানার জন্য
 router.get("/check-payments", authorize("admin", "super-admin"), checkPayments);
 
 /**
- * @section Transaction History (Order Matters!)
- * 🚀 Fixed: Static routes must come BEFORE parameterized routes to avoid 500 errors.
+ * @section 5. Transaction History (Ordering is Critical)
  */
-
-// 1. Admin/Super-Admin Full Audit
 router.get(
   "/all-transactions",
   authorize("admin", "super-admin"),
-  getAllTransactions
+  getAllTransactions,
 );
-
-// 2. Personal History (For the logged-in Member)
-// Express will check this first when the URL is /history/me
 router.get("/history/me", getMemberHistory);
-
-// 3. Member Lookup (For Admins to see specific user history)
-// Express will check this if the URL is /history/65a123...
 router.get("/history/:id", authorize("admin", "super-admin"), getMemberHistory);
 
 /**
- * @section Super-Admin Project Management
+ * @section 2. Defaulter & Fine Management
+ */
+// নতুন রাউট যোগ করুন (Waive Fine এর জন্য) [cite: 2026-01-15]
+router.post(
+  "/waive-fine",
+  authorize("admin", "super-admin"),
+  require("../controllers/financeController").waiveFinePartial,
+);
+
+/**
+ * @section 6. Super-Admin Restricted Management
  */
 router.put(
   "/investment/:id",
   authorize("super-admin"),
   upload.single("legalDocs"),
-  updateInvestment
+  updateInvestment,
 );
 router.delete("/investment/:id", authorize("super-admin"), deleteInvestment);
 

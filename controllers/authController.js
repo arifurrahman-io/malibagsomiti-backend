@@ -1,6 +1,63 @@
 const User = require("../models/User");
 const jwt = require("jsonwebtoken");
 const bcrypt = require("bcryptjs");
+const { sendWelcomeEmail } = require("../utils/email"); // ✅ Integrated your email utility
+
+// @desc    Register a new member & send welcome email
+// @route   POST /api/auth/register
+// authController.js এর register ফাংশনের ভেতর
+exports.register = async (req, res) => {
+  const { name, email, password, phone, branch, joiningDate } = req.body;
+
+  try {
+    const userExists = await User.findOne({ email });
+    if (userExists) {
+      return res
+        .status(400)
+        .json({ success: false, message: "User already exists" });
+    }
+
+    const user = await User.create({
+      name,
+      email,
+      password, // এটি মডেলের pre-save middleware দ্বারা হ্যাশ হবে
+      phone,
+      branch,
+      joiningDate: joiningDate || Date.now(),
+    });
+
+    if (user) {
+      // ✅ এখানে plain text 'password' পাঠানো হচ্ছে যাতে মেম্বার সেটি দেখতে পায়
+      try {
+        await sendWelcomeEmail(user.email, user.name, password);
+      } catch (mailError) {
+        console.error("Email failed:", mailError);
+      }
+
+      const token = jwt.sign(
+        { id: user._id, role: user.role },
+        process.env.JWT_SECRET,
+        { expiresIn: "1d" },
+      );
+
+      res.status(201).json({
+        success: true,
+        token,
+        user: {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+          phone: user.phone,
+          role: user.role,
+          branch: user.branch,
+          joiningDate: user.joiningDate,
+        },
+      });
+    }
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+};
 
 // @desc    Authenticate user & get token
 // @route   POST /api/auth/login
@@ -8,38 +65,28 @@ exports.login = async (req, res) => {
   const { email, password } = req.body;
 
   try {
-    // 1. Find user and explicitly include hidden fields needed for state
     const user = await User.findOne({ email }).select("+password");
 
     if (!user) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid Email or Password",
-      });
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid Email or Password" });
     }
 
-    // 2. Compare passwords
     const isMatch = await bcrypt.compare(password, user.password);
 
     if (!isMatch) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid Email or Password",
-      });
+      return res
+        .status(401)
+        .json({ success: false, message: "Invalid Email or Password" });
     }
 
-    // 3. Generate JWT
     const token = jwt.sign(
       { id: user._id, role: user.role },
       process.env.JWT_SECRET,
-      { expiresIn: "1d" }
+      { expiresIn: "1d" },
     );
 
-    /**
-     * 4. SYNCED RESPONSE:
-     * Added 'joiningDate' to fix the "N/A" dashboard issue.
-     * Added 'phone' to ensure Member ID shows correctly.
-     */
     res.json({
       success: true,
       token,
@@ -47,11 +94,11 @@ exports.login = async (req, res) => {
         id: user._id,
         name: user.name,
         email: user.email,
-        phone: user.phone, // ✅ Fixed: For Member ID visibility
+        phone: user.phone,
         role: user.role,
         branch: user.branch,
         shares: user.shares || 0,
-        joiningDate: user.joiningDate, // ✅ Fixed: Resolves "Membership Active: N/A"
+        joiningDate: user.joiningDate,
       },
     });
   } catch (error) {
@@ -75,13 +122,11 @@ exports.updateProfile = async (req, res) => {
         .json({ success: false, message: "User not found" });
     }
 
-    // Update allowable fields
     user.name = req.body.name || user.name;
     user.phone = req.body.phone || user.phone;
 
     const updatedUser = await user.save();
 
-    // Return the full updated object to refresh the frontend store correctly
     res.json({
       success: true,
       data: {
@@ -92,7 +137,7 @@ exports.updateProfile = async (req, res) => {
         role: updatedUser.role,
         branch: updatedUser.branch,
         shares: updatedUser.shares,
-        joiningDate: updatedUser.joiningDate, // ✅ Maintain sync after profile update
+        joiningDate: updatedUser.joiningDate,
       },
     });
   } catch (error) {
@@ -112,10 +157,9 @@ exports.updatePassword = async (req, res) => {
         .json({ success: false, message: "User not found" });
     }
 
-    // Verify current credentials
     const isMatch = await bcrypt.compare(
       req.body.currentPassword,
-      user.password
+      user.password,
     );
     if (!isMatch) {
       return res
@@ -123,7 +167,6 @@ exports.updatePassword = async (req, res) => {
         .json({ success: false, message: "Invalid current password" });
     }
 
-    // Hash is handled by the User model's pre-save middleware
     user.password = req.body.newPassword;
     await user.save();
 
@@ -133,5 +176,41 @@ exports.updatePassword = async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
+  }
+};
+
+/**
+ * @desc    Update FCM Token for Push Notifications
+ * @route   PUT /api/auth/update-fcm-token
+ * @access  Private
+ */
+exports.updateFCMToken = async (req, res) => {
+  try {
+    const { fcmToken } = req.body;
+
+    if (!fcmToken) {
+      return res.status(400).json({
+        success: false,
+        message: "No token provided",
+      });
+    }
+
+    // req.user.id is available via your 'protect' middleware
+    const user = await User.findByIdAndUpdate(
+      req.user.id,
+      { fcmToken },
+      { new: true, runValidators: true },
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "FCM Token updated successfully",
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: "Server Error during token update",
+      error: error.message,
+    });
   }
 };

@@ -12,7 +12,6 @@ const investmentSchema = new mongoose.Schema(
       required: true,
       min: 0,
     },
-    // 🔥 ADD THIS FIELD: Reference to the BankAccount model
     bankAccount: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "BankAccount",
@@ -33,6 +32,7 @@ const investmentSchema = new mongoose.Schema(
     },
     legalDocs: {
       type: String,
+      default: "",
     },
     recordedBy: {
       type: mongoose.Schema.Types.ObjectId,

@@ -12,7 +12,7 @@ const sendEmail = async (options) => {
   });
 
   const mailOptions = {
-    from: `"Malibag Teachers' Society" <${process.env.EMAIL_USER}>`,
+    from: `"Malibagh Somiti" <${process.env.EMAIL_USER}>`,
     to: options.email,
     subject: options.subject,
     html: options.html,
@@ -33,7 +33,7 @@ const sendDepositEmail = async (email, data) => {
         <p><strong>Date:</strong> ${data.date}</p>
         <p><strong>Total Savings:</strong> BDT ${data.totalBalance}</p>
       </div>
-      <p style="font-size: 12px; color: #64748b;">This is an automated notification from Malibag Teachers' Society.</p>
+      <p style="font-size: 12px; color: #64748b;">This is an automated notification from Malibagh Somiti.</p>
     </div>
   `;
 

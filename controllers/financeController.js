@@ -9,6 +9,7 @@ const BankAccount = require("../models/BankAccount");
 const FineSetting = require("../models/FineSetting");
 const admin = require("../config/firebase");
 const { sendPushNotification } = require("../utils/notification");
+const Notification = require("../models/Notification");
 
 const dir = "./uploads/documents/";
 
@@ -31,118 +32,191 @@ exports.processDeposit = async (req, res) => {
   session.startTransaction();
 
   try {
-    const { userIds, remarks, month, year } = req.body;
+    const {
+      userIds = [],
+      membersPayingFine = [],
+      remarks,
+      month,
+      year,
+    } = req.body;
 
-    // ১. মাদার অ্যাকাউন্ট খুঁজে বের করা (ট্রেজারি সোর্স)
     const motherAccount = await BankAccount.findOne({
       isMotherAccount: true,
     }).session(session);
-
     if (!motherAccount)
       throw new Error("No Mother Account designated in registry.");
 
-    // ২. মাস এবং বছর নির্ধারণ (ডিফল্ট বর্তমান সময়)
+    const settings = (await FineSetting.findOne().session(session)) || {
+      gracePeriodMonths: 2,
+      finePercentage: 5,
+    };
+
     const targetMonth =
       month || new Date().toLocaleString("default", { month: "long" });
     const targetYear = year || new Date().getFullYear();
     let totalBatchAmount = 0;
 
     const depositDataList = [];
+    const notificationsToInsert = [];
+    const fcmTokensToSend = [];
 
-    // ৩. ব্যাচ প্রসেসিং এবং মেম্বার ডেটা আপডেট
-    await Promise.all(
-      userIds.map(async (id) => {
-        const user = await User.findById(id).session(session);
-        if (!user) return;
+    // 1️⃣ Loop through users to process ledger entries
+    for (const id of userIds) {
+      const user = await User.findById(id).session(session);
+      if (!user) continue;
 
-        // শেয়ার অনুযায়ী টাকার পরিমাণ নির্ধারণ (৳১০০০ প্রতি শেয়ার)
-        const amount = (user.shares || 1) * 1000;
-        totalBatchAmount += amount;
+      const shareAmount = (user.shares || 1) * 1000;
+      let memberTransactionTotal = shareAmount;
 
-        // ইউজারের মোট জমার পরিমাণ আপডেট করা
-        const updatedUser = await User.findByIdAndUpdate(
-          id,
-          { $inc: { totalDeposited: amount } },
-          { session, new: true },
-        );
-
-        // লেজার বা ট্রানজেকশন রেকর্ড তৈরি করা
-        await Transaction.create(
-          [
-            {
-              user: id,
-              type: "deposit",
-              category: "monthly_deposit",
-              subcategory: "Member Monthly Share",
-              amount,
-              month: targetMonth,
-              year: targetYear,
-              date: new Date(),
-              bankAccount: motherAccount._id,
-              recordedBy: req.user.id,
-              remarks:
-                remarks ||
-                `Monthly Share Collection: ${targetMonth} ${targetYear}`,
+      // --- 🚀 FINE PROCESSING ---
+      if (membersPayingFine.includes(id)) {
+        // Aggregate without session to avoid MongoDB "Illegal Operation" errors
+        const fineReductions = await Transaction.aggregate([
+          {
+            $match: {
+              user: user._id,
+              category: { $in: ["fine_waiver", "fine_payment"] },
             },
-          ],
-          { session },
-        );
+          },
+          { $group: { _id: null, total: { $sum: "$amount" } } },
+        ]);
 
-        // ✅ ইমেইলের জন্য প্রয়োজনীয় ডেটা পুশ করা (undefined ফিক্স করার জন্য month ও year সহ)
-        depositDataList.push({
-          email: user.email,
-          name: user.name,
-          amount: amount,
-          totalBalance: updatedUser.totalDeposited,
-          date: new Date().toLocaleDateString("en-GB"),
-          month: targetMonth, // সাবজেক্টের জন্য পাঠানো হচ্ছে
-          year: targetYear, // সাবজেক্টের জন্য পাঠানো হচ্ছে
-        });
+        const totalReduced = fineReductions[0]?.total || 0;
+        const fineCalc = calculateFineLogic(user, settings, totalReduced);
+        const fineToPay = fineCalc.fine;
 
-        if (user.fcmToken) {
-          sendPushNotification([user.fcmToken], {
-            title: "Deposit Confirmed 💰",
-            body: `৳${amount.toLocaleString()} has been added to your savings for ${targetMonth}.`,
-            data: { screen: "Dashboard" },
-          });
+        if (fineToPay > 0) {
+          memberTransactionTotal += fineToPay;
+          await Transaction.create(
+            [
+              {
+                user: id,
+                type: "deposit",
+                category: "fine_payment",
+                amount: fineToPay,
+                month: targetMonth,
+                year: targetYear,
+                date: new Date(),
+                bankAccount: motherAccount._id,
+                recordedBy: req.user.id,
+                remarks: `Penalty Payment: ${targetMonth} ${targetYear}`,
+              },
+            ],
+            { session },
+          );
         }
-      }),
-    );
+      }
 
-    // ৪. ব্যাংকের ব্যালেন্স আপডেট করা
+      // Update user savings
+      const updatedUser = await User.findByIdAndUpdate(
+        id,
+        { $inc: { totalDeposited: shareAmount } },
+        { session, new: true },
+      );
+
+      // Record Share Deposit
+      await Transaction.create(
+        [
+          {
+            user: id,
+            type: "deposit",
+            category: "monthly_deposit",
+            subcategory: "Member Monthly Share",
+            amount: shareAmount,
+            month: targetMonth,
+            year: targetYear,
+            date: new Date(),
+            bankAccount: motherAccount._id,
+            recordedBy: req.user.id,
+            remarks: remarks || `Monthly Share: ${targetMonth} ${targetYear}`,
+          },
+        ],
+        { session },
+      );
+
+      totalBatchAmount += memberTransactionTotal;
+
+      // 2️⃣ Collect data for Notifications/Emails
+      depositDataList.push({
+        email: user.email,
+        name: user.name,
+        amount: memberTransactionTotal,
+        totalBalance: updatedUser.totalDeposited,
+        month: targetMonth,
+        year: targetYear,
+      });
+
+      if (user.fcmTokens?.length > 0) {
+        fcmTokensToSend.push(...user.fcmTokens);
+        user.fcmTokens.forEach((token) => {
+          notificationsToInsert.push({
+            userId: user._id,
+            title: "Deposit Confirmed 💰",
+            body: `৳${memberTransactionTotal.toLocaleString()} received for ${targetMonth}.`,
+            type: "DEPOSIT",
+            fcmToken: token,
+            sentAt: new Date(),
+          });
+        });
+      }
+    }
+
     motherAccount.currentBalance += totalBatchAmount;
     await motherAccount.save({ session });
 
-    // ৫. ডেটাবেস ট্রানজেকশন কমিট করা
+    // 3️⃣ Commit DB Changes
     await session.commitTransaction();
     session.endSession();
 
-    // ৬. ✅ সাকসেসফুলি সেভ হওয়ার পর মেম্বারদের ইমেইল নোটিফিকেশন পাঠানো
-    // Promise.allSettled ব্যবহার করা হয়েছে যাতে একজনের ইমেইল ফেইল হলেও বাকিদেরটা যায়।
-    Promise.allSettled(
-      depositDataList.map((data) =>
-        sendDepositEmail(data.email, {
-          name: data.name,
-          amount: data.amount,
-          date: data.date,
-          totalBalance: data.totalBalance,
-          month: data.month, // সাবজেক্ট এবং টেমপ্লেটের জন্য
-          year: data.year, // সাবজেক্ট এবং টেমপ্লেটের জন্য
-        }),
-      ),
-    ).catch((err) => console.error("Batch Email Error:", err));
+    // 4️⃣ Execute Async Tasks (Email and Push)
+    // We use Promise.allSettled so if one email fails, others still send
+
+    // Save bell notifications
+    if (notificationsToInsert.length > 0) {
+      Notification.insertMany(notificationsToInsert).catch((e) =>
+        console.error("Bell Error:", e),
+      );
+    }
+
+    // Send Push Notifications
+    if (fcmTokensToSend.length > 0) {
+      sendPushNotification(fcmTokensToSend, {
+        notification: {
+          title: "Deposit Confirmed 💰",
+          body: `Monthly payment for ${targetMonth} processed.`,
+        },
+        data: { screen: "Dashboard", type: "DEPOSIT" },
+      }).catch((e) => console.error("Push Error:", e));
+    }
+
+    // ✅ FIXED: Send Emails with individual error handling
+    if (depositDataList.length > 0) {
+      Promise.allSettled(
+        depositDataList.map((data) =>
+          sendDepositEmail(data.email, {
+            name: data.name,
+            amount: data.amount,
+            date: new Date().toLocaleDateString("en-GB"),
+            totalBalance: data.totalBalance,
+            month: data.month,
+            year: data.year,
+          }),
+        ),
+      ).then((results) => {
+        const failed = results.filter((r) => r.status === "rejected");
+        if (failed.length > 0)
+          console.error(`${failed.length} emails failed to send.`);
+      });
+    }
 
     res.status(201).json({
       success: true,
-      message: `Ledger Synchronized: ৳${totalBatchAmount.toLocaleString()} added to Treasury.`,
-      count: userIds.length,
-      totalProcessed: totalBatchAmount,
+      message: `Batch complete: ৳${totalBatchAmount.toLocaleString()} added to Treasury.`,
     });
   } catch (error) {
-    // কোনো এরর হলে সব পরিবর্তন রোলব্যাক করা হবে
-    await session.abortTransaction();
+    if (session.inTransaction()) await session.abortTransaction();
     session.endSession();
-    console.error("Batch Deposit Failure:", error.message);
+    console.error("Critical Deposit Failure:", error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 };
@@ -174,16 +248,24 @@ exports.checkPayments = async (req, res) => {
   try {
     const { month, year, branch } = req.query;
 
-    if (!month || !year || !branch) {
+    // 1. Validation: Only Month and Year are strictly required for a global check
+    if (!month || !year) {
       return res.status(400).json({
         success: false,
-        message: "Month, year, and branch are required parameters.",
+        message: "Month and year are required parameters.",
       });
+    }
+
+    // 2. Build Dynamic Match Filter
+    // We only filter by branch if it's provided and not set to "All"
+    const userMatch = {};
+    if (branch && branch !== "All") {
+      userMatch.branch = branch;
     }
 
     /**
      * 🚀 OPTIMIZED QUERY:
-     * Using $lookup or pre-filtering by branch via populated user match.
+     * Fetch transactions and populate users based on the dynamic branch filter.
      */
     const existingTransactions = await Transaction.find({
       type: "deposit",
@@ -192,16 +274,17 @@ exports.checkPayments = async (req, res) => {
       year: parseInt(year),
     }).populate({
       path: "user",
-      select: "branch",
-      match: { branch: branch }, // Only populate if branch matches
+      select: "branch _id",
+      match: Object.keys(userMatch).length > 0 ? userMatch : null, // Apply branch filter only if needed
     });
 
     /**
      * 🚀 DATA CLEANUP:
-     * Filter out transactions where the user didn't match the branch criteria.
+     * 1. Filter out transactions where the user didn't match the branch (if branch was specified).
+     * 2. If branch is "All", we keep everyone who has a valid user object.
      */
     const paidMemberIds = existingTransactions
-      .filter((t) => t.user !== null) // If match failed, user is null
+      .filter((t) => t.user !== null)
       .map((t) => t.user._id);
 
     res.status(200).json({
@@ -837,34 +920,30 @@ exports.addInvestment = async (req, res) => {
   try {
     const { projectName, amount, bankAccount, startDate, remarks } = req.body;
 
-    // ১. ফান্ডিং সোর্স যাচাই (ট্রেজারি চেক)
+    // 1️⃣ Validate Funding Source
     const fundingBank =
       await BankAccount.findById(bankAccount).session(session);
-
     if (!fundingBank) {
       throw new Error("Target bank account not found in registry.");
     }
-
     if (fundingBank.currentBalance < Number(amount)) {
       throw new Error(
-        `Insufficient funds in ${
-          fundingBank.bankName
-        }. Available: ৳${fundingBank.currentBalance.toLocaleString()}`,
+        `Insufficient funds in ${fundingBank.bankName}. Available: ৳${fundingBank.currentBalance.toLocaleString()}`,
       );
     }
 
-    // ২. ফাইল আপলোড লজিক (cPanel স্টোরেজ পাথ)
+    // 2️⃣ File Upload Handling
     let legalDocsPath = "";
     if (req.file) {
       legalDocsPath = `/uploads/documents/${req.file.filename}`;
     }
 
-    // ৩. ডেটা ফরম্যাটিং (Registry এবং ফিল্টারিংয়ের জন্য)
+    // 3️⃣ Date Formatting
     const dateObj = startDate ? new Date(startDate) : new Date();
     const month = dateObj.toLocaleString("default", { month: "long" });
     const year = dateObj.getFullYear();
 
-    // ৪. ইনভেস্টমেন্ট রেকর্ড তৈরি (Project Record)
+    // 4️⃣ Create Investment Record
     const investment = await Investment.create(
       [
         {
@@ -881,11 +960,11 @@ exports.addInvestment = async (req, res) => {
       { session },
     );
 
-    // ৫. ব্যাংকের ব্যালেন্স আপডেট (Real-time Liquidity)
+    // 5️⃣ Update Bank Balance
     fundingBank.currentBalance -= Number(amount);
     await fundingBank.save({ session });
 
-    // ৬. লেজার বা ট্রানজেকশন এন্ট্রি (Audit Trail এর জন্য)
+    // 6️⃣ Create Transaction Record (Audit Trail)
     await Transaction.create(
       [
         {
@@ -900,61 +979,86 @@ exports.addInvestment = async (req, res) => {
           month,
           year,
           remarks: `Capital Allocation: ${projectName}`,
-          referenceId: investment[0]._id, // প্রোজেক্টের সাথে ট্রানজেকশন লিঙ্ক করা
+          referenceId: investment[0]._id,
         },
       ],
       { session },
     );
 
-    // ৭. সব অপারেশন সফল হলে ট্রানজেকশন কমিট করুন (নোটিফিকেশন পাঠানোর আগেই এটি শেষ করা জরুরি)
+    // 7️⃣ Commit Transaction - Critical for data integrity before notifications
     await session.commitTransaction();
     session.endSession();
 
-    // ৮. মেম্বারদের পুশ নোটিফিকেশন পাঠানো (সাকসেসফুল সেভ হওয়ার পর)
-    // শুধুমাত্র যাদের FCM Token আছে এবং যারা একটিভ মেম্বার তাদের ফিল্টার করা হয়েছে
-    const allMembers = await User.find({
-      role: "member",
-      status: "active",
-      fcmToken: { $ne: null },
-    }).select("fcmToken");
+    // 8️⃣ Fetch Active Members With FCM Tokens
+    try {
+      const allMembers = await User.find({
+        role: "member",
+        status: "active",
+        fcmTokens: { $exists: true, $ne: [] },
+      }).select("fcmTokens _id");
 
-    const memberTokens = allMembers.map((m) => m.fcmToken).filter((t) => t);
+      const notificationsToInsert = [];
+      const tokensToSend = [];
 
-    if (memberTokens.length > 0) {
-      // utils/notification.js এর মাধ্যমে নোটিফিকেশন পাঠানো হচ্ছে
-      await sendPushNotification(memberTokens, {
-        title: "New Project Initiated! 🚀",
-        body: `We just started "${projectName}" with a capital of ৳${Number(amount).toLocaleString()}.`,
-        data: {
-          screen: "Investments",
-          id: investment[0]._id.toString(),
-        },
+      const notifTitle = `New Project Initiated! 🚀`;
+      const notifBody = `We just started "${projectName}" with a capital of ৳${Number(amount).toLocaleString()}.`;
+
+      allMembers.forEach((member) => {
+        if (Array.isArray(member.fcmTokens) && member.fcmTokens.length > 0) {
+          tokensToSend.push(...member.fcmTokens);
+
+          member.fcmTokens.forEach((token) => {
+            notificationsToInsert.push({
+              userId: member._id,
+              title: notifTitle,
+              body: notifBody,
+              type: "INVESTMENT",
+              referenceId: investment[0]._id,
+              delivered: true,
+              read: false,
+              sentAt: new Date(),
+            });
+          });
+        }
       });
-      console.log(
-        `Successfully sent project notification to ${memberTokens.length} members.`,
-      );
+
+      if (tokensToSend.length > 0) {
+        // ✅ CORRECTED PAYLOAD: Separated Notification and Data for background alerts
+        await sendPushNotification(tokensToSend, {
+          notification: {
+            title: notifTitle,
+            body: notifBody,
+          },
+          data: {
+            screen: "Investments",
+            id: investment[0]._id.toString(),
+            type: "INVESTMENT",
+          },
+        });
+
+        if (notificationsToInsert.length > 0) {
+          await Notification.insertMany(notificationsToInsert);
+        }
+      }
+    } catch (notifError) {
+      console.error("Non-critical Notification Error:", notifError.message);
     }
 
-    // ৯. সাকসেস রেসপন্স পাঠানো
+    // 9️⃣ Respond Success
     res.status(201).json({
       success: true,
-      message: `${projectName} initiated successfully with ৳${Number(
-        amount,
-      ).toLocaleString()}`,
+      message: `${projectName} initiated successfully. All members have been notified.`,
       data: investment[0],
     });
   } catch (error) {
-    // কোনো এরর হলে সব পরিবর্তন রোলব্যাক করা হবে
-    if (session.inTransaction()) {
-      await session.abortTransaction();
-    }
+    if (session.inTransaction()) await session.abortTransaction();
+    session.endSession();
+
     console.error("Investment Failure:", error.message);
     res.status(400).json({
       success: false,
       message: error.message || "Failed to initiate investment project",
     });
-  } finally {
-    if (session) session.endSession();
   }
 };
 
@@ -1660,7 +1764,6 @@ exports.getMemberSummary = async (req, res) => {
           $match: {
             user: new mongoose.Types.ObjectId(userId),
             type: "deposit",
-            // 🔥 CRITICAL: Exclude fine payments from personal savings
             category: { $ne: "fine_payment" },
           },
         },
@@ -1673,10 +1776,6 @@ exports.getMemberSummary = async (req, res) => {
       User.findById(userId).select(
         "shares phone joiningDate monthlySubscription",
       ),
-      /**
-       * 🔥 Aggregate all fine reductions (Waivers + Paid Fines)
-       * Both reduce the remaining 'Total Fine Due' balance.
-       */
       Transaction.aggregate([
         {
           $match: {
@@ -1691,44 +1790,70 @@ exports.getMemberSummary = async (req, res) => {
     const globalData = globalStats[0] || { totalIncome: 0, totalExpense: 0 };
     const totalReduced = fineReductions[0]?.total || 0;
 
-    // 3. 🔥 DYNAMIC FINE CALCULATION
+    // 3. 🔥 DYNAMIC FINE CALCULATION & MONTHLY BREAKDOWN
     let totalFineDue = 0;
     let overdueMonths = 0;
+    let fineDetails = [];
 
     if (userDetails && userDetails.joiningDate) {
       const today = new Date();
       const start = new Date(userDetails.joiningDate);
+      const shareCount = userDetails.shares || 1;
 
-      let monthDiff = (today.getFullYear() - start.getFullYear()) * 12;
-      monthDiff += today.getMonth() - start.getMonth();
+      // ✅ FIX: Use the stored subscription directly or calculate once if missing
+      // Do NOT multiply shareCount * monthlySubscription as that doubles the value
+      const monthlyInstallment =
+        userDetails.monthlySubscription || shareCount * 1000;
 
-      // Cumulative fine logic for EVERY overdue month
-      if (monthDiff > activeSettings.gracePeriodMonths) {
-        overdueMonths = monthDiff - activeSettings.gracePeriodMonths;
-        const shareCount = userDetails.shares || 1;
-        const monthlyInstallment =
-          shareCount * (userDetails.monthlySubscription || 1000);
+      const monthlyFineRate =
+        (monthlyInstallment * activeSettings.finePercentage) / 100;
 
-        const monthlyFine =
-          (monthlyInstallment * activeSettings.finePercentage) / 100;
-        const grossCalculatedFine = Math.round(overdueMonths * monthlyFine);
+      // Start calculating from the month AFTER joining
+      let checkDate = new Date(start.getFullYear(), start.getMonth() + 1, 1);
 
-        // 🔥 Subtract BOTH partial waivers and already paid fines from the gross penalty
-        totalFineDue = Math.max(0, grossCalculatedFine - totalReduced);
+      while (checkDate < new Date(today.getFullYear(), today.getMonth(), 1)) {
+        const yearDiff = today.getFullYear() - checkDate.getFullYear();
+        const monthDiff = today.getMonth() - checkDate.getMonth();
+        const monthsAgoFinished = yearDiff * 12 + monthDiff - 1;
+
+        // Cumulative fine logic for EVERY overdue month past grace period
+        if (monthsAgoFinished > activeSettings.gracePeriodMonths) {
+          const monthName = checkDate.toLocaleString("default", {
+            month: "long",
+          });
+          const yearName = checkDate.getFullYear();
+          const calculatedFine = Math.round(
+            monthsAgoFinished * monthlyFineRate,
+          );
+
+          fineDetails.push({
+            month: monthName,
+            year: yearName,
+            payableAmount: monthlyInstallment,
+            fineAmount: calculatedFine,
+          });
+
+          totalFineDue += calculatedFine;
+          overdueMonths++;
+        }
+        checkDate.setMonth(checkDate.getMonth() + 1);
       }
+
+      // Subtract both waivers and cash payments from gross penalty
+      totalFineDue = Math.max(0, Math.round(totalFineDue) - totalReduced);
     }
 
     // 4. Response Data Mapped for React Native UI
     res.status(200).json({
       success: true,
       data: {
-        // Top Card Summary: reflects savings WITHOUT fine payments
         netLiquidity: personalStats[0]?.total || 0,
         societyShares: userDetails?.shares || 0,
         memberId: userDetails?.phone || "N/A",
-        totalFineDue: totalFineDue, // Remaining balance after adjustments
+        totalFineDue: totalFineDue,
+        fineDetails: fineDetails,
         overdueMonths: overdueMonths,
-        totalFineAdjustments: totalReduced, // Total of waivers + cash payments
+        totalFineAdjustments: totalReduced,
 
         globalRegistry: {
           income: globalData.totalIncome,
@@ -1923,46 +2048,59 @@ exports.getInvestmentById = async (req, res) => {
 const calculateFineLogic = (member, settings, totalReduced = 0) => {
   const { gracePeriodMonths, finePercentage } = settings;
   const today = new Date();
+
+  // 1. Installment & Monthly Fine Rate based on shares
+  const monthlyInstallment =
+    (member.shares || 1) * (member.monthlySubscription || 1000);
+  const monthlyFineRate = (monthlyInstallment * finePercentage) / 100;
+
+  // 2. Determine start and end points for calculation
   const joiningDate = new Date(member.joiningDate);
+  // Calculation only goes up to the last fully finished month (e.g., if today is June, last finished is May)
+  const lastFinishedMonthIndex = today.getMonth() - 1;
+  const currentYear = today.getFullYear();
 
-  // 1. Calculate total months since joining
-  let totalMonthsSinceJoining =
-    (today.getFullYear() - joiningDate.getFullYear()) * 12;
-  totalMonthsSinceJoining += today.getMonth() - joiningDate.getMonth();
+  let grossFine = 0;
+  let overdueMonthsCount = 0;
 
-  // 2. Fine applies only if total months strictly exceed the grace period
-  if (totalMonthsSinceJoining > gracePeriodMonths) {
-    const overdueMonths = totalMonthsSinceJoining - gracePeriodMonths;
-    const shareCount = member.shares || 1;
+  /**
+   * 🚀 TIME-WEIGHTED ITERATION:
+   * We start from the month after joining and iterate through every month up to the last finished month.
+   */
+  let checkDate = new Date(
+    joiningDate.getFullYear(),
+    joiningDate.getMonth() + 1,
+    1,
+  );
 
-    // Member-specific subscription or default to 1000
-    const monthlyInstallment =
-      shareCount * (member.monthlySubscription || 1000);
-
-    // Monthly Fine Rate = (Installment * Percentage / 100)
-    const monthlyFineAmount = (monthlyInstallment * finePercentage) / 100;
-
-    // Total Gross Fine = (Monthly Fine * Number of Overdue Months)
-    const grossFine = Math.round(overdueMonths * monthlyFineAmount);
+  while (checkDate < new Date(currentYear, today.getMonth(), 1)) {
+    // Calculate how many months have passed since this specific month ended
+    const yearDiff = today.getFullYear() - checkDate.getFullYear();
+    const monthDiff = today.getMonth() - checkDate.getMonth();
+    const monthsAgoFinished = yearDiff * 12 + monthDiff - 1;
 
     /**
-     * 🚀 FINAL CALCULATION:
-     * We subtract 'totalReduced' which includes:
-     * - category: "fine_waiver" (Admin adjustments)
-     * - category: "fine_payment" (Cash already paid by member)
+     * ✅ YOUR SPECIFIC RULE:
+     * If grace period is 2, and a month finished 3 months ago, it gets 3 months of fines.
+     * If it finished 2 months ago, it is within grace and gets 0 fines.
      */
-    const remainingFine = Math.max(0, grossFine - totalReduced);
+    if (monthsAgoFinished > gracePeriodMonths) {
+      grossFine += monthsAgoFinished * monthlyFineRate;
+      overdueMonthsCount++;
+    }
 
-    return {
-      fine: remainingFine, // The final amount the member still owes
-      months: overdueMonths,
-      dueAmount: monthlyInstallment * overdueMonths, // Principal amount overdue
-      totalReduced: totalReduced, // For transparency in UI
-    };
+    // Increment iterator by one month
+    checkDate.setMonth(checkDate.getMonth() + 1);
   }
 
-  // No fine applicable if within grace period
-  return { fine: 0, months: 0, dueAmount: 0, totalReduced: 0 };
+  // 3. Final balance after manual waivers or partial payments
+  const remainingFine = Math.max(0, Math.round(grossFine) - totalReduced);
+
+  return {
+    fine: remainingFine,
+    months: overdueMonthsCount,
+    totalReduced: totalReduced,
+  };
 };
 
 /**
@@ -2119,40 +2257,36 @@ exports.updateFineSettings = async (req, res) => {
  */
 exports.getDefaulterList = async (req, res) => {
   try {
-    // 1. Fetch the latest fine engine settings
+    // 1. Fetch current dynamic engine settings
     const settings = (await FineSetting.findOne()) || {
       gracePeriodMonths: 1,
       finePercentage: 5,
     };
 
-    // 2. Fetch active members
-    const members = await User.find({
-      role: "member",
-      status: "active",
-    }).select("name phone joiningDate shares branch monthlySubscription");
-
-    /**
-     * 3. Fetch all fine reductions (Waivers and Paid Fines)
-     * We treat 'fine_payment' as a deduction from the total calculated penalty.
-     */
-    const fineReductions = await Transaction.aggregate([
-      {
-        $match: {
-          category: { $in: ["fine_waiver", "fine_payment"] },
+    // 2. Parallel Fetch: Active members and all fine-related ledger adjustments
+    const [members, fineReductions] = await Promise.all([
+      User.find({ role: "member", status: "active" }).select(
+        "name phone joiningDate shares branch monthlySubscription",
+      ),
+      Transaction.aggregate([
+        {
+          $match: {
+            category: { $in: ["fine_waiver", "fine_payment"] },
+          },
         },
-      },
-      {
-        $group: {
-          _id: "$user",
-          totalReduced: { $sum: "$amount" },
+        {
+          $group: {
+            _id: "$user",
+            totalReduced: { $sum: "$amount" },
+          },
         },
-      },
+      ]),
     ]);
 
-    // 4. Map members to the defaulter list using cumulative logic
+    // 3. Process Defaulter Registry with Dynamic Calculations
     const defaulters = members
       .map((member) => {
-        // Find the total reduction (waivers + payments) for this specific member
+        // Find total reductions (Paid Fines + Admin Waivers) for this member
         const reductionData = fineReductions.find(
           (r) => r._id.toString() === member._id.toString(),
         );
@@ -2160,30 +2294,41 @@ exports.getDefaulterList = async (req, res) => {
           ? reductionData.totalReduced
           : 0;
 
-        // Calculate fine using the centralized cumulative month logic
+        /**
+         * 🚀 REAL-TIME CALCULATION:
+         * Calculates overdue months, time-weighted fine, and dynamic principal due.
+         */
         const calc = calculateFineLogic(member, settings, totalReducedAmount);
 
-        // Only include in the list if there is still a remaining fine due
-        if (calc.fine > 0) {
+        /**
+         * ✅ INCLUSION LOGIC:
+         * Include member if they owe a penalty OR if they have overdue months (Principal Due).
+         */
+        if (calc.fine > 0 || calc.months > 0) {
           return {
             ...member._doc,
-            totalFineDue: calc.fine, // Remaining balance after waivers/payments
-            overdueMonths: calc.months, // Months exceeding grace period
-            dueAmount: calc.dueAmount, // Total principal installments overdue
-            totalReductions: totalReducedAmount, // Total of waivers and payments
+            totalFineDue: calc.fine, // Penalty amount after reductions
+            overdueMonths: calc.months, // Total calendar months past grace period
+            dueAmount: calc.dueAmount, // Dynamic Principal (Installment Rate * Overdue Months)
+            totalReductions: totalReducedAmount, // Total ledger adjustments (Paid + Waived)
           };
         }
         return null;
       })
       .filter((m) => m !== null);
 
+    // 4. Respond with formatted registry data for the frontend table
     res.status(200).json({
       success: true,
       count: defaulters.length,
       data: defaulters,
     });
   } catch (error) {
-    console.error("Defaulter Registry Error:", error.message);
-    res.status(500).json({ success: false, error: error.message });
+    console.error("Defaulter Registry Sync Error:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Failed to synchronize defaulter registry.",
+      error: error.message,
+    });
   }
 };

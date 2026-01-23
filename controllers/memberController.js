@@ -1,7 +1,9 @@
 const User = require("../models/User");
+const XLSX = require("xlsx");
 const Transaction = require("../models/Transaction");
 const mongoose = require("mongoose");
 const { sendWelcomeEmail } = require("../utils/email"); // ✅ Added Email Utility
+const bcrypt = require("bcryptjs");
 
 /**
  * ✅ CREATE MEMBER: Atomic Registry Entry
@@ -59,7 +61,7 @@ exports.createMember = async (req, res) => {
       } catch (mailError) {
         console.error(
           "Member created but Welcome Email failed:",
-          mailError.message
+          mailError.message,
         );
         // We do not block the response even if the email fails
       }
@@ -93,13 +95,23 @@ exports.getAllMembers = async (req, res) => {
     const { branch, status, search } = req.query;
 
     let matchFilter = { role: "member" };
-    if (branch) matchFilter.branch = branch;
-    if (status) matchFilter.status = status;
 
+    // 1. Handle Branch Filtering
+    if (branch && branch !== "All") {
+      matchFilter.branch = branch;
+    }
+
+    // 2. Handle Status Filtering
+    if (status) {
+      matchFilter.status = status;
+    }
+
+    // 3. Advanced Search
     if (search) {
       matchFilter.$or = [
         { name: { $regex: search, $options: "i" } },
         { phone: { $regex: search, $options: "i" } },
+        { bankAccount: { $regex: `${search}$`, $options: "i" } },
       ];
     }
 
@@ -116,6 +128,9 @@ exports.getAllMembers = async (req, res) => {
       {
         $addFields: {
           id: { $toString: "$_id" },
+          // ✅ FIX: Explicitly ensure totalFineDue is passed through
+          // If the field is missing in DB, default it to 0
+          totalFineDue: { $ifNull: ["$totalFineDue", 0] },
           totalDeposited: {
             $sum: {
               $map: {
@@ -133,14 +148,25 @@ exports.getAllMembers = async (req, res) => {
           },
         },
       },
-      { $project: { txs: 0, password: 0, __v: 0 } },
-      { $sort: { name: 1 } },
-    ]);
+      // ✅ PROJECT: Ensure we only hide sensitive/unnecessary data
+      // Do NOT exclude totalFineDue here
+      {
+        $project: {
+          txs: 0,
+          password: 0,
+          __v: 0,
+        },
+      },
+      { $sort: { bankAccount: 1 } },
+    ]).collation({ locale: "en_US", numericOrdering: true });
 
-    res
-      .status(200)
-      .json({ success: true, count: members.length, data: members });
+    res.status(200).json({
+      success: true,
+      count: members.length,
+      data: members,
+    });
   } catch (error) {
+    console.error("Fetch Registry Error:", error);
     res.status(500).json({
       success: false,
       message: "Failed to fetch registry.",
@@ -214,7 +240,7 @@ exports.updateMember = async (req, res) => {
     const updatedMember = await User.findByIdAndUpdate(
       req.params.id,
       { $set: updateData },
-      { new: true, runValidators: true }
+      { new: true, runValidators: true },
     ).select("-password");
 
     if (!updatedMember)
@@ -286,6 +312,80 @@ exports.deleteMember = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Deletion failed.",
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * ✅ BULK IMPORT MEMBERS: High-Performance Spreadsheet Sync
+ * Handles password hashing, 2023-default date calibration, and subscription math.
+ */
+exports.bulkImportMembers = async (req, res) => {
+  try {
+    const { members } = req.body;
+
+    if (!members || !Array.isArray(members)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid data format. Expected an array of members.",
+      });
+    }
+
+    // Prepare members with secure hashing and business logic calibration
+    const formattedMembers = await Promise.all(
+      members.map(async (m) => {
+        // 1. Force the Default Joining Date to Jan 1st, 2023 (Noon)
+        // Using Noon (12:00:00) prevents timezone offsets from shifting it to Dec 31st
+        const validatedDate =
+          m.joiningDate && !isNaN(Date.parse(m.joiningDate))
+            ? new Date(m.joiningDate)
+            : new Date("2023-01-01T12:00:00");
+
+        // 2. Manual Password Hashing (Required for insertMany)
+        const salt = await bcrypt.genSalt(10);
+        const hashedPassword = await bcrypt.hash(
+          m.password || "Member123",
+          salt,
+        );
+
+        // 3. Financial Calibration
+        const shareCount = parseInt(m.shares) || 1;
+        const subscription = shareCount * 1000;
+
+        return {
+          name: m.name,
+          email: m.email,
+          phone: m.phone,
+          nid: m.nid,
+          bankAccount: m.bankAccount,
+          accountNumber: m.accountNumber,
+          branch: m.branch || "Malibagh-A-Day",
+          password: hashedPassword, // Store securely
+          role: "member",
+          status: "active",
+          joiningDate: validatedDate,
+          shares: shareCount,
+          monthlySubscription: subscription,
+        };
+      }),
+    );
+
+    // 4. Batch Insertion
+    // { ordered: false } ensures that if one row (e.g., duplicate NID) fails,
+    // the rest are still processed.
+    const result = await User.insertMany(formattedMembers, { ordered: false });
+
+    res.status(201).json({
+      success: true,
+      message: `${result.length} profiles successfully synchronized with the registry.`,
+      data: result,
+    });
+  } catch (error) {
+    console.error("Bulk Import Operational Failure:", error);
+    res.status(500).json({
+      success: false,
+      message: "Registry sync failed. Ensure NIDs and Emails are unique.",
       error: error.message,
     });
   }

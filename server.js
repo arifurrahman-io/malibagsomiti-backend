@@ -89,6 +89,7 @@ app.use("/api/finance/transaction", require("./routes/transactionRoutes"));
  * Full Path Example: /api/finance/fine-settings
  */
 app.use("/api/finance", require("./routes/financeRoutes"));
+app.use("/api/notifications", require("./routes/notificationRoutes"));
 
 /**
  * 8. Server Health & Root Access

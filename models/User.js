@@ -89,9 +89,10 @@ const userSchema = new mongoose.Schema(
       enum: ["active", "inactive"],
       default: "active",
     },
-    fcmToken: {
-      type: String,
-      default: null,
+    // models/User.js
+    fcmTokens: {
+      type: [String],
+      default: [],
     },
   },
   {

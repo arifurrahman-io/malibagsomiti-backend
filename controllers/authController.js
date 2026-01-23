@@ -191,26 +191,39 @@ exports.updateFCMToken = async (req, res) => {
     if (!fcmToken) {
       return res.status(400).json({
         success: false,
-        message: "No token provided",
+        message: "No FCM token provided",
       });
     }
 
-    // req.user.id is available via your 'protect' middleware
-    const user = await User.findByIdAndUpdate(
-      req.user.id,
-      { fcmToken },
-      { new: true, runValidators: true },
-    );
+    const user = await User.findById(req.user.id);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    // ✅ SAFETY: Initialize if missing (important for admin)
+    if (!Array.isArray(user.fcmTokens)) {
+      user.fcmTokens = [];
+    }
+
+    // ✅ Prevent duplicates
+    if (!user.fcmTokens.includes(fcmToken)) {
+      user.fcmTokens.push(fcmToken);
+      await user.save();
+    }
 
     res.status(200).json({
       success: true,
-      message: "FCM Token updated successfully",
+      message: "FCM token registered successfully",
     });
   } catch (error) {
+    console.error("FCM Token Update Error:", error);
     res.status(500).json({
       success: false,
-      message: "Server Error during token update",
-      error: error.message,
+      message: "Failed to update FCM token",
     });
   }
 };

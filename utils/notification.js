@@ -1,46 +1,64 @@
-const admin = require("firebase-admin");
+const admin = require("../config/firebase");
+const Notification = require("../models/Notification");
 
-/**
- * Sends push notifications via Firebase
- * @param {Array} tokens - Array of FCM registration tokens
- * @param {Object} payload - { title, body, data }
- */
-exports.sendPushNotification = async (tokens, payload) => {
-  // Filter out null or empty tokens to prevent Firebase errors
-  const validTokens = tokens.filter((token) => token && token !== "");
-  if (validTokens.length === 0) return;
+exports.sendPushNotification = async (tokens, payload, userId) => {
+  const validTokens = tokens.filter(Boolean);
+  if (!validTokens.length) return;
 
   const message = {
-    notification: {
+    android: { priority: "high" },
+    data: {
+      type: payload.type || "GENERAL",
       title: payload.title,
       body: payload.body,
+      referenceId: payload.referenceId || "",
+      timestamp: Date.now().toString(),
     },
-    android: {
-      priority: "high", // ✅ Required for background reliability
-      notification: {
-        channelId: "default", // ✅ Required for system tray visibility
-        sound: "default",
-      },
-    },
-    data: payload.data || {},
     tokens: validTokens,
   };
 
   try {
-    // sendEachForMulticast is the modern standard for batch notifications
     const response = await admin.messaging().sendEachForMulticast(message);
-    console.log(`Successfully sent ${response.successCount} notifications.`);
 
-    if (response.failureCount > 0) {
-      const failedTokens = [];
-      response.responses.forEach((resp, idx) => {
-        if (!resp.success) {
-          failedTokens.push(validTokens[idx]);
+    // Log history for EACH token
+    const notifications = validTokens.map((token) => ({
+      user: userId,
+      fcmToken: token,
+      title: payload.title,
+      body: payload.body,
+      type: payload.type || "GENERAL",
+      referenceId: payload.referenceId || null,
+      delivered: true, // can be updated later if delivery fails
+      sentAt: new Date(),
+    }));
+
+    await Notification.insertMany(notifications);
+
+    // Cleanup invalid tokens (as before)
+    const invalidTokens = [];
+    response.responses.forEach((resp, idx) => {
+      if (!resp.success) {
+        const code = resp.error?.code;
+        if (
+          code === "messaging/registration-token-not-registered" ||
+          code === "messaging/invalid-registration-token"
+        ) {
+          invalidTokens.push(validTokens[idx]);
         }
-      });
-      console.warn(`Failed tokens: ${failedTokens.length}`);
+      }
+    });
+
+    if (invalidTokens.length) {
+      await User.updateMany(
+        { fcmTokens: { $in: invalidTokens } },
+        { $pull: { fcmTokens: { $in: invalidTokens } } },
+      );
     }
+
+    console.log(
+      `Push sent: ${response.successCount} success, ${response.failureCount} failed`,
+    );
   } catch (error) {
-    console.error("Firebase Multicast Error:", error);
+    console.error("FCM Send Error:", error);
   }
 };

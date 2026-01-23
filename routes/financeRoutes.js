@@ -81,7 +81,7 @@ router.post(
 router
   .route("/fine-settings")
   .get(authorize("admin", "super-admin"), getFineSettings)
-  .put(authorize("super-admin"), updateFineSettings);
+  .put(authorize("admin", "super-admin"), updateFineSettings);
 
 router.get("/defaulters", authorize("admin", "super-admin"), getDefaulterList);
 
